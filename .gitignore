@@ -1,0 +1,15 @@
+# Temporary and audio capture files
+temp_*
+*.wav
+*.bin
+*.txt
+*.s
+*.o
+*.cdb
+*.noi
+*.map
+*.ihx
+__pycache__/
+
+# Compiled ROMs in bin
+bin/
