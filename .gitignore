@@ -10,6 +10,8 @@ temp_*
 *.map
 *.ihx
 __pycache__/
+furnace/
+.build/
 
 # Compiled ROMs in bin
 bin/

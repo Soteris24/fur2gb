@@ -75,7 +75,7 @@ def main():
     print("=" * 80)
 
     if all_passed:
-        print("\n[SUCCESS] ALL 7 SONGS 100% VERIFIED AND BIT-LEVEL COMPLIANT!\n")
+        print("\n[SUCCESS] ALL 7 SONGS PASSED SPECTRAL REGRESSION!\n")
     else:
         print("\n[FAILURE] One or more songs failed verification!\n")
         sys.exit(1)
