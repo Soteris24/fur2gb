@@ -15,3 +15,8 @@ furnace/
 
 # Compiled ROMs in bin
 bin/
+
+# fur2gb build output (verification ROMs, generated songs)
+build/
+# the player's hand-written assembly
+!driver/*.s

@@ -1,757 +1,584 @@
 #!/usr/bin/env python3
-"""
-fur2gb.py - Furnace (.fur) to Game Boy C/ASM converter.
-Uses Furnace headless CLI to export text format, then compiles
-into compact, byte-aligned Game Boy driver tables and bytecode.
+"""fur2gb - compile a Furnace Game Boy song into register-write streams for driver/furplayer.
+
+Furnace itself is the compiler: the instrumented Furnace build (tools/furtrace.py) plays the song
+and records every register write its GB backend makes, tick by tick. This tool turns that record
+into compact bytecode that driver/furplayer replays, so every effect, macro, WaveSynth and compat
+flag behaves exactly as in Furnace. The only Furnace state the player models is the GB backend's
+anti-click wave rotation, which depends on playback time and so is not periodic across loops; the
+model is checked against the position Furnace reports at every wave rewrite.
+
+A song is 5 streams that the player runs in this order every tick, which is the order Furnace
+writes in:
+    A      writes made while Furnace processes the row (dispatch(): instrument, volume, panning...)
+    B0-B3  writes made by DivPlatformGB::tick() for channel 0..3 (it only touches that channel's
+           registers, plus NR51 and wave RAM)
+Splitting by channel lets repeated passages of each channel compress on their own.
+
+Stream bytecode (one tick of a stream = ops up to and including an END op):
+    00-2F vv      write vv to $FF10+op (never NR33/NR34)
+    30 vv / 31 vv write NR33 / NR34 (the player tracks ch3's period for anti-click)
+    40-7F         END: end of tick, then (op & 3F) more empty ticks for this stream
+    80-81 ii      WAVE: NR30=0, then base wave (op&1)<<8|ii into wave RAM, anti-click rotated
+    82            anti-click reset (phase reset macro)
+    83            STOP: song ended
+    84 cc ll hh nn       CALL: play nn END-units from chunk cc offset hhll, then return
+    85 cc ll hh nl nh    CALL with a 16-bit unit count
+    86 cc ll hh          JUMP to chunk cc offset hhll
+    87 kl kh p0 p1 p2    SETRATE: anti-click step k, tick period p (1/16 cycles)
+    88 rr xx nn   ZOMBIE: write xx to $FF00+rr, then nn times 09, 11, 08 (Furnace's zombie-mode
+                  volume change, DivPlatformGB::tick() killIt)
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import argparse
-import subprocess
 import re
-import zlib
 import struct
+import sys
+from collections import defaultdict
+from pathlib import Path
 
-NOTE_MAP = {
-    'C-': 0, 'C#': 1, 'D-': 2, 'D#': 3, 'E-': 4, 'F-': 5,
-    'F#': 6, 'G-': 7, 'G#': 8, 'A-': 9, 'A#': 10, 'B-': 11
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import furtrace  # noqa: E402
 
-def parse_note(note_str):
-    if not note_str or note_str == '...':
-        return 0 # FUR_NOTE_NONE
-    if note_str in ('OFF', '==='):
-        return 254 # FUR_NOTE_OFF
-    
-    match = re.match(r'^([A-G][#-]?)(-?\d+)$', note_str)
-    if match:
-        name, oct_str = match.groups()
-        octave = int(oct_str)
-        if name in NOTE_MAP:
-            semi = NOTE_MAP[name]
-            # Note 60 is C-0 in Furnace
-            return 60 + octave * 12 + semi
-    return 0
+CHUNK_SIZE = 16384
+MAX_DEPTH = 4          # player call stack size per stream
+NSTREAMS = 5           # A, B0..B3
+OP_NR33, OP_NR34 = 0x30, 0x31
+OP_END = 0x40
+OP_WAVE, OP_ACRESET, OP_STOP = 0x80, 0x82, 0x83
+CALL8, CALL16, JUMP, SETRATE, ZOMBIE = 0x84, 0x85, 0x86, 0x87, 0x88
+NR50_MASK = 0x77       # VIN bits off: SameBoy (Furnace) ignores them, hardware may not
 
-def parse_fx(fx_str):
-    if not fx_str or fx_str == '....' or len(fx_str) < 4:
-        return (0, 0)
-    fx_t_str = fx_str[:2]
-    fx_v_str = fx_str[2:]
-    if fx_t_str == '..':
-        return (0, 0)
-    try:
-        fx_t = int(fx_t_str, 16)
-        fx_v = int(fx_v_str, 16) if fx_v_str != '..' else 0
-        return (fx_t, fx_v)
-    except Exception:
-        return (0, 0)
 
-def expand_adsr(params, max_ticks=48):
-    if len(params) < 9:
-        return params
-    low, high, ar, ht, dr, sl, st, sr, rr = params[:9]
-    pos = (low << 8) | (0xFF if low > high else 0)
-    top = (high << 8) | 0xFF
-    bottom = low << 8
-    sus = (sl << 8) | 0xFF
-    top_inv = high << 8
-    bottom_inv = (low << 8) | 0xFF
-    sus_inv = sl << 8
+def f32(x: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", x))[0]
 
-    lastPos = 0
-    delay = 0
-    out = []
 
-    for _ in range(max_ticks):
-        if delay > 0:
-            delay -= 1
-        else:
-            if low <= high:
-                if lastPos == 0:
-                    pos += ar
-                    if pos >= top:
-                        pos = top
-                        lastPos = 1
-                        delay = ht
-                elif lastPos == 1:
-                    pos -= dr
-                    if pos <= sus:
-                        pos = sus
-                        lastPos = 2
-                        delay = st
-                elif lastPos == 2:
-                    pos -= sr
-                    if pos <= bottom:
-                        pos = bottom
-                        lastPos = 4
-                elif lastPos == 4:
-                    pos = bottom
-            else:
-                if lastPos == 0:
-                    pos -= ar
-                    if pos <= top_inv:
-                        pos = top_inv
-                        lastPos = 1
-                        delay = ht
-                elif lastPos == 1:
-                    pos += dr
-                    if pos >= sus_inv:
-                        pos = sus_inv
-                        lastPos = 2
-                        delay = st
-                elif lastPos == 2:
-                    pos += sr
-                    if pos >= bottom_inv:
-                        pos = bottom_inv
-                        lastPos = 4
-                elif lastPos == 4:
-                    pos = bottom_inv
-        val = pos >> 8
-        if low <= high:
-            val = max(low, min(high, val))
-        else:
-            val = max(high, min(low, val))
-        out.append(val)
-        if lastPos == 4 and len(out) >= 4 and all(v == out[-1] for v in out[-4:]):
-            break
-    return out
+def anticlick_step(hz: float) -> int:
+    """antiClickPeriodCount += (chipClock>>1)/getCurHz(): float32 math, truncated (count < freq)."""
+    q = f32(f32(2097152.0) / f32(max(f32(hz), 1.0)))
+    k = int(q)  # count + q < 2^24 and count is integral, so trunc(count + q) == count + trunc(q)
+    if k + 2048 > 0xFFFF:
+        raise SystemExit(f"tick rate {hz} Hz is too slow for the 16-bit anti-click counter")
+    return k
 
-def expand_lfo(params, max_ticks=32):
-    if len(params) < 14:
-        return params
-    low, high = params[0], params[1]
-    speed = params[11]
-    wave = params[12] & 3
-    phase = params[13]
 
-    bottom = low << 8
-    top = (high << 8) | 0xFF
-    pos = bottom
-    lfoDir = False
-    out = []
-    for _ in range(max_ticks):
-        if wave == 0: # triangle
-            if lfoDir:
-                pos -= speed
-                if pos < bottom:
-                    lfoDir = False
-                    pos += speed * 2
-            else:
-                pos += speed
-                if pos > top:
-                    lfoDir = True
-                    pos -= speed * 2
-            val = pos >> 8
-        elif wave == 1: # saw
-            pos += speed
-            if pos > top:
-                pos -= (top - bottom)
-            val = pos >> 8
-        else: # pulse
-            pos = (pos + speed) & 0xFFFF
-            val = high if (pos & 0x8000) else low
-        out.append(val)
-    return out
+def tick_period(hz: float) -> int:
+    return round(4194304 * 16 / hz)
 
-def parse_txt_export(content):
-    lines = content.splitlines()
-    i = 0
-    num_lines = len(lines)
 
-    instruments = []
-    wavetables = []
-    subsongs = []
+def owner(a: int) -> int:
+    """Channel whose registers `a` belongs to, -1 for global registers (NR50-NR52)."""
+    if 0x10 <= a <= 0x14:
+        return 0
+    if 0x16 <= a <= 0x19:
+        return 1
+    if 0x1a <= a <= 0x1e or 0x30 <= a <= 0x3f:
+        return 2
+    if 0x20 <= a <= 0x23:
+        return 3
+    return -1
 
-    cur_ins = None
-    cur_subsong = None
 
-    in_subsongs = False
+class AntiClick:
+    """Mirror of DivPlatformGB's antiClickWavePos/antiClickPeriodCount, driven by register writes."""
 
-    while i < num_lines:
-        line = lines[i].strip()
-        
-        if line.startswith('# Subsongs'):
-            in_subsongs = True
-            cur_ins = None
-
-        # Parse Instruments
-        elif not in_subsongs and line.startswith('## ') and ': ' in line and not line.startswith('## Patterns'):
-            # Instrument header
-            m = re.match(r'^##\s+([0-9A-Fa-f]+):\s*(.*)', line)
-            if m:
-                ins_id = int(m.group(1), 16)
-                ins_name = m.group(2)
-                cur_ins = {
-                    'id': ins_id,
-                    'name': ins_name,
-                    'volume': 15,
-                    'direction': 0,
-                    'length': 2,
-                    'sound_len': 64,
-                    'soft_env': 0,
-                    'vol_macro': None,
-                    'arp_macro': None,
-                    'duty_macro': None,
-                    'wave_macro': None
-                }
-                instruments.append(cur_ins)
-        
-        elif cur_ins and line.startswith('- volume:'):
-            cur_ins['volume'] = int(line.split(':')[1].strip())
-        elif cur_ins and line.startswith('- direction:'):
-            cur_ins['direction'] = 1 if 'up' in line.lower() else 0
-        elif cur_ins and line.startswith('- length:'):
-            cur_ins['length'] = int(line.split(':')[1].strip())
-        elif cur_ins and line.startswith('- sound length:'):
-            cur_ins['sound_len'] = int(line.split(':')[1].strip())
-        elif cur_ins and line.startswith('- use software envelope:'):
-            cur_ins['soft_env'] = 1 if 'yes' in line.lower() else 0
-        
-        # Macros
-        elif cur_ins and re.match(r'^\s*-\s*(vol|arp|duty|wave):\s*(.*)', line):
-            m = re.match(r'^\s*-\s*(vol|arp|duty|wave):\s*(.*)', line)
-            m_type = m.group(1)
-            raw_tokens = m.group(2).split()
-            
-            values = []
-            loop = 0xFF
-            for tok in raw_tokens:
-                if tok == '|':
-                    loop = len(values)
-                elif tok.startswith('[') or tok == '/':
-                    continue
-                else:
-                    try:
-                        v = int(tok)
-                        if v >= 0x40000000:
-                            v = v & 0x3FFFFFFF
-                        values.append(v)
-                    except ValueError:
-                        pass
-            
-            if '[ADSR]' in line:
-                values = expand_adsr(values)
-            elif '[LFO]' in line:
-                values = expand_lfo(values)
-            
-            macro_obj = {'len': len(values), 'loop': loop if loop < len(values) else 0xFF, 'values': values}
-            if m_type == 'vol': cur_ins['vol_macro'] = macro_obj
-            elif m_type == 'arp': cur_ins['arp_macro'] = macro_obj
-            elif m_type == 'duty': cur_ins['duty_macro'] = macro_obj
-            elif m_type == 'wave': cur_ins['wave_macro'] = macro_obj
-
-        # Parse Wavetables
-        elif line.startswith('- ') and '(32x16):' in line:
-            # e.g. - 0 (32x16): 7 8 10 11 ... 32
-            parts = line.split(':')[1].strip().split()
-            samples = [int(p) for p in parts[:32]]
-            # Pack 32 nibbles into 16 bytes (high nibble first)
-            # Furnace defaults to invertWave = true for Game Boy (nibbles ^= 15)
-            packed = []
-            for s_idx in range(0, 32, 2):
-                n1 = (samples[s_idx] ^ 15) & 0x0F
-                n2 = (samples[s_idx + 1] ^ 15) & 0x0F
-                packed.append((n1 << 4) | n2)
-            wavetables.append(packed)
-
-        # Parse Subsong
-        elif in_subsongs and line.startswith('## ') and not line.startswith('## Patterns'):
-            cur_subsong = {
-                'tick_rate': 60,
-                'virtual_tempo_n': 150,
-                'virtual_tempo_d': 150,
-                'speeds': [6],
-                'pattern_len': 64,
-                'orders': [[], [], [], []],
-                'patterns': {} # (order_idx, chan_idx) -> list of rows
-            }
-            subsongs.append(cur_subsong)
-        elif cur_subsong and line.startswith('- tick rate:'):
-            cur_subsong['tick_rate'] = int(float(line.split(':')[1].strip()))
-        elif cur_subsong and line.startswith('- virtual tempo:'):
-            m_vt = re.search(r'(\d+)/(\d+)', line)
-            if m_vt:
-                cur_subsong['virtual_tempo_n'] = int(m_vt.group(1))
-                cur_subsong['virtual_tempo_d'] = int(m_vt.group(2))
-        elif cur_subsong and line.startswith('- speeds:'):
-            parts = line.split(':')[1].strip().split()
-            cur_subsong['speeds'] = [int(p) for p in parts]
-        elif cur_subsong and line.startswith('- pattern length:'):
-            cur_subsong['pattern_len'] = int(line.split(':')[1].strip())
-        
-        # Orders table
-        elif cur_subsong and line == 'orders:':
-            i += 1 # skip '```'
-            i += 1
-            while i < num_lines and lines[i].strip() != '```':
-                ord_line = lines[i].strip()
-                if '|' in ord_line:
-                    vals = ord_line.split('|')[1].strip().split()
-                    for ch_idx in range(4):
-                        if ch_idx < len(vals):
-                            val = int(vals[ch_idx], 16) if vals[ch_idx] != '..' else 0xFF
-                            cur_subsong['orders'][ch_idx].append(val)
-                i += 1
-
-        # Patterns
-        elif cur_subsong and line.startswith('----- ORDER '):
-            order_idx = int(line.split()[2], 16)
-            i += 1
-            # Read rows for this order
-            order_rows = [[] for _ in range(4)]
-            while i < num_lines and re.match(r'^[0-9A-Fa-f]{2,3}\s*\|', lines[i].strip()):
-                row_line = lines[i].strip()
-                ch_parts = row_line.split('|')[1:]
-                for ch_idx in range(4):
-                    if ch_idx < len(ch_parts):
-                        tokens = ch_parts[ch_idx].strip().split()
-                        note_str = tokens[0] if len(tokens) > 0 else '...'
-                        ins_str  = tokens[1] if len(tokens) > 1 else '..'
-                        vol_str  = tokens[2] if len(tokens) > 2 else '..'
-                        fx1_str  = tokens[3] if len(tokens) > 3 else '....'
-                        fx2_str  = tokens[4] if len(tokens) > 4 else '....'
-                        order_rows[ch_idx].append({
-                            'note': parse_note(note_str),
-                            'ins': int(ins_str, 16) if ins_str != '..' else 0xFF,
-                            'vol': int(vol_str, 16) if vol_str != '..' else 0xFF,
-                            'fx1': parse_fx(fx1_str),
-                            'fx2': parse_fx(fx2_str),
-                        })
-                i += 1
-            for ch_idx in range(4):
-                cur_subsong['patterns'][(order_idx, ch_idx)] = order_rows[ch_idx]
-            continue
-
-        i += 1
-
-    return {
-        'instruments': instruments,
-        'wavetables': wavetables,
-        'subsong': subsongs[0] if subsongs else None
-    }
-
-def parse_fur_binary(filepath):
-    with open(filepath, 'rb') as f:
-        raw = f.read()
-    try:
-        data = zlib.decompress(raw)
-    except Exception:
-        data = raw
-
-    cur = 32
-    instruments = []
-    wavetables = []
-    
-    while cur < len(data) - 8:
-        magic = data[cur:cur+4].decode('ascii', errors='ignore')
-        blen = struct.unpack_from('<I', data, cur+4)[0]
-        payload = data[cur+8:cur+8+blen]
-        
-        if magic == 'WAVE':
-            null_pos = payload.find(b'\x00')
-            if null_pos != -1:
-                p = null_pos + 1
-                wlen, wmin, wmax = struct.unpack_from('<iii', payload, p)
-                p += 12
-                samples = []
-                for s in range(wlen):
-                    val = struct.unpack_from('<i', payload, p + s * 4)[0]
-                    samples.append(val)
-                wavetables.append({'len': wlen, 'max': wmax, 'samples': samples})
-            
-        elif magic == 'INS2':
-            ins_info = {'ws': None}
-            ws_idx = payload.find(b'WS')
-            if ws_idx != -1 and ws_idx + 4 + 17 <= len(payload):
-                ws_len = struct.unpack_from('<H', payload, ws_idx+2)[0]
-                if ws_len >= 17:
-                    w1, w2 = struct.unpack_from('<ii', payload, ws_idx+4)
-                    rdiv, fx, en, glob_f, spd, p1, p2, p3, p4 = struct.unpack_from('<BBBBBBBBB', payload, ws_idx+12)
-                    ins_info['ws'] = {
-                        'wave1': w1,
-                        'wave2': w2,
-                        'rateDivider': rdiv,
-                        'effect': fx,
-                        'enabled': bool(en),
-                        'global': bool(glob_f),
-                        'speed': spd,
-                        'param1': p1,
-                        'param2': p2,
-                        'param3': p3,
-                        'param4': p4
-                    }
-            instruments.append(ins_info)
-        cur += 8 + blen
-
-    return instruments, wavetables
-
-class DivWaveSynthSim:
-    def __init__(self, w1_samples, w2_samples, ws_dict):
-        self.width = 32
-        self.height = 15
-        self.wave1 = [int(x * self.height / 15) for x in w1_samples[:32]]
-        self.wave2 = [int(x * self.height / 15) for x in w2_samples[:32]]
-        self.output = list(self.wave1)
-        self.state = ws_dict
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
         self.pos = 0
-        self.stage = 0
-        self.stage_dir = False
-        self.div_counter = 0
+        self.cnt = 0
+        self.nr33 = 0
+        self.nr34 = 0
+        self.freq_known = False
+
+    def freq(self):
+        return 2048 - (((self.nr34 & 7) << 8) | self.nr33) if self.freq_known else 0
+
+    def tick(self, k):
+        f = self.freq()
+        if self.enabled and f > 0:
+            self.cnt += k
+            self.pos = (self.pos + self.cnt // f) & 31
+            self.cnt %= f
+
+    def write(self, a, v):
+        if a == 0x1d:
+            self.nr33 = v
+        elif a == 0x1e:
+            self.nr34 = v
+            self.freq_known = True
+
+
+class AntiClickMismatch(Exception):
+    pass
+
+
+def canon_ticks(trace, anticlick_enabled):
+    """Convert traced ticks to per-stream op bytes: a list of NSTREAMS-tuples of bytes."""
+    ac = AntiClick(anticlick_enabled)
+    waves = []
+    wave_ids = {}
+    out = []
+    hz = None
+    for ti, t in enumerate(trace.ticks):
+        streams = [bytearray() for _ in range(NSTREAMS)]
+        if ti == 0:
+            ops = list(trace.init) + list(t.ops)
+        else:
+            ops = t.ops
+            if t.hz != hz:
+                # the player steps anti-click before a tick's ops: the new rate goes at the very
+                # end of the previous tick (stream B3 runs last)
+                out[-1][4] += (bytes([SETRATE]) + anticlick_step(t.hz).to_bytes(2, "little")
+                               + tick_period(t.hz).to_bytes(3, "little"))
+        hz = t.hz
+        ac.tick(anticlick_step(hz))
+        cur = 0           # stream receiving ops: 0 = A until the "P" marker, then 1 + channel
+        in_tick = False
+        i = 0
+        while i < len(ops):
+            op = ops[i]
+            if op[0] == "P":
+                in_tick = True
+                cur = 1
+                i += 1
+                continue
+            if op[0] == "V":
+                _, pos, cnt, freq = op
+                blk = ops[i + 1:i + 18]
+                if (len(blk) != 17 or blk[0] != ("W", 0x1a, 0)
+                        or any(blk[1 + k][:2] != ("W", 0x30 + k) for k in range(16))):
+                    raise ValueError(f"tick {ti}: unexpected wave update {blk}")
+                if (pos & 31, cnt, freq) != (ac.pos, ac.cnt, ac.freq()):
+                    raise AntiClickMismatch(f"tick {ti}: Furnace pos/cnt/freq {pos & 31}/{cnt}/{freq}, "
+                                            f"model {ac.pos}/{ac.cnt}/{ac.freq()}")
+                r = pos & 31
+                m = []
+                for k in range(16):
+                    v = blk[1 + k][2]
+                    m += [v >> 4, v & 15]
+                n = [m[(j - r) & 31] for j in range(32)]
+                even = bytes((n[2 * k] << 4) | n[2 * k + 1] for k in range(16))
+                odd = bytes((n[2 * k + 1] << 4) | n[(2 * k + 2) & 31] for k in range(16))
+                key = even + odd
+                if key not in wave_ids:
+                    wave_ids[key] = len(waves)
+                    waves.append(key)
+                wid = wave_ids[key]
+                if wid >= 512:
+                    raise SystemExit("more than 512 distinct base waves")
+                code = bytes([OP_WAVE | (wid >> 8), wid & 0xff])
+                o = 2
+                i += 18
+            elif op[0] == "Z":
+                ac.pos = ac.cnt = 0
+                code = bytes([OP_ACRESET])
+                o = 2
+                i += 1
+            else:
+                _, a, v = op
+                if not 0x10 <= a <= 0x3f:
+                    raise ValueError(f"tick {ti}: write to unknown register {a:#x}")
+                if 0x30 <= a <= 0x3f:
+                    raise ValueError(f"tick {ti}: wave RAM write outside updateWave()")
+                if a == 0x24:
+                    v &= NR50_MASK
+                ac.write(a, v)
+                code = bytes([{0x1d: OP_NR33, 0x1e: OP_NR34}.get(a, a - 0x10), v])
+                o = owner(a)
+                i += 1
+            if in_tick and o >= 0:
+                # tick() runs channel 0..3 in order, each writing only its own registers
+                if 1 + o < cur:
+                    raise SystemExit(f"tick {ti}: channel {o} write after channel {cur - 1} in tick()")
+                cur = 1 + o
+            streams[cur] += code
+        out.append(streams)
+    return [tuple(pack_zombie(bytes(s)) for s in t) for t in out], waves
+
+
+def split_ops(code: bytes):
+    """Split a tick's stream bytes (no END) into ops."""
+    ops, i = [], 0
+    while i < len(code):
+        op = code[i]
+        n = 2 if op < 0x32 or op in (OP_WAVE, OP_WAVE | 1) else 1 if op == OP_ACRESET else 6 if op == SETRATE             else 4 if op == ZOMBIE else None
+        if n is None:
+            raise ValueError(f"unexpected op {op:#x}")
+        ops.append(code[i:i + n])
+        i += n
+    return ops
+
+
+def pack_zombie(code: bytes) -> bytes:
+    """NRx2 = x followed by k x (09, 11, 08) -> one ZOMBIE op."""
+    ops = split_ops(code)
+    out = bytearray()
+    i = 0
+    while i < len(ops):
+        op = ops[i]
+        if op[0] in (0x02, 0x07, 0x11):
+            k = 0
+            while (k < 255 and i + 3 * k + 3 < len(ops)
+                   and [bytes(o) for o in ops[i + 1 + 3 * k:i + 4 + 3 * k]]
+                   == [bytes([op[0], 0x09]), bytes([op[0], 0x11]), bytes([op[0], 0x08])]):
+                k += 1
+            if k:
+                out += bytes([ZOMBIE, 0x10 + op[0], op[1], k])
+                i += 1 + 3 * k
+                continue
+        out += op
+        i += 1
+    return bytes(out)
+
+
+def analyse(trace):
+    """Pick the anti-click model, canonicalise ticks and find the steady loop."""
+    try:
+        ticks, waves = canon_ticks(trace, True)
+        anticlick = True
+    except AntiClickMismatch as e:
+        first = e
+        try:
+            ticks, waves = canon_ticks(trace, False)
+            anticlick = False
+        except AntiClickMismatch:
+            raise SystemExit(f"anti-click model does not match Furnace: {first}")
+
+    loops = trace.loop_ticks()
+    loop_start = None
+    end = len(ticks)
+    stops = [i for i, t in enumerate(trace.ticks) if not t.chip_ticked()]
+    if stops:
+        # FFxx: the song ends on this tick (its row writes still happen, the chip's tick() does
+        # not). Furnace may still run one more tick if its audio buffer isn't finished, which
+        # depends on buffer boundaries, so the player stops here.
+        if loops and loops[0] < stops[0]:
+            raise SystemExit(f"song stops at tick {stops[0]} after looping at {loops}")
+        return ticks[:stops[0] + 1], waves, None, anticlick
+    if loops:
+        # body k = ticks[loops[k]:loops[k+1]]; find the first body that repeats unchanged to the end
+        bodies = [(loops[k], loops[k + 1]) for k in range(len(loops) - 1)]
+        for k in range(len(bodies) - 1):
+            s0, e0 = bodies[k]
+            if all(ticks[s:e] == ticks[s0:e0] for s, e in bodies[k + 1:]):
+                loop_start, end = s0, e0
+                break
+        if loop_start is None:
+            raise SystemExit(f"song does not settle into a repeating loop within {len(bodies)} loops "
+                             f"(loop ticks {loops}); trace more loops with --loops")
+    return ticks[:end], waves, loop_start, anticlick
+
+
+def build_units(ticks, loop_start):
+    """One stream's ticks -> units: a tick's ops + END, absorbing up to 63 following empty ticks.
+    Never merges across the loop start."""
+    units, loop_unit = [], None
+    i = 0
+    while i < len(ticks):
+        if i == loop_start:
+            loop_unit = len(units)
+        j = i + 1
+        while j < len(ticks) and not ticks[j] and j != loop_start and j - i - 1 < 63:
+            j += 1
+        units.append(ticks[i] + bytes([OP_END | (j - i - 1)]))
+        i = j
+    return units, loop_unit
+
+
+def compress(units, loop_unit, min_gain=16):
+    """Greedy LZ over units: items are ('L', unit) or ('C', src_item, nunits, depth).
+    A CALL replays already emitted items; it never starts at or crosses the loop start, so the
+    loop JUMP can land on a literal unit."""
+    items = []
+    cover = []                     # units covered per item
+    size = []                      # bytes per item
+    item_at_unit = {}              # unit index -> item index for literal items
+    cands = defaultdict(list)      # (unit[i], unit[i+1]) -> literal item start units
+    nunits = len(units)
+    usize = [len(u) for u in units]
+    i = 0
+    while i < nunits:
+        best = None
+        if i + 1 < nunits and i != loop_unit:
+            limit = nunits if loop_unit is None or i >= loop_unit else loop_unit
+            for j in reversed(cands.get((units[i], units[i + 1]), [])[-48:]):
+                m = 0
+                while i + m < limit and j + m < i and units[j + m] == units[i + m]:
+                    m += 1
+                k = item_at_unit[j]
+                acc = got = depth = maxd = 0
+                while k < len(items) and acc < m:
+                    acc += cover[k]
+                    if items[k][0] == "C":
+                        maxd = max(maxd, items[k][3])
+                    if acc <= m and maxd + 1 <= MAX_DEPTH:
+                        got = acc
+                        depth = maxd + 1
+                    k += 1
+                if got < 2:
+                    continue
+                gain = sum(usize[i:i + got]) - (5 if got < 256 else 6)
+                if gain >= min_gain and (best is None or gain > best[0]):
+                    best = (gain, j, got, depth)
+        if best:
+            _, j, got, depth = best
+            items.append(("C", item_at_unit[j], got, depth))
+            cover.append(got)
+            size.append(5 if got < 256 else 6)
+            i += got
+        else:
+            item_at_unit[i] = len(items)
+            if i + 1 < nunits:
+                cands[(units[i], units[i + 1])].append(i)
+            items.append(("L", i, 1, 0))
+            cover.append(1)
+            size.append(usize[i])
+            i += 1
+    loop_item = None
+    if loop_unit is not None:
+        u = 0
+        for k, it in enumerate(items):
+            if u == loop_unit:
+                loop_item = k
+                break
+            u += cover[k]
+        assert loop_item is not None and items[loop_item][0] == "L"
+    return items, size, loop_item
+
+
+def layout(streams, has_loop):
+    """Place every stream's items into chunks of CHUNK_SIZE bytes.
+    streams: [(units, items, size, loop_item)]. Returns (chunks, entry points)."""
+    chunks = [bytearray()]
+    entries = []
+    tail = 4  # room for a JUMP to the next chunk / the loop
+    for units, items, size, loop_item in streams:
+        where = []
+        for k, it in enumerate(items):
+            if len(chunks[-1]) + size[k] + tail > CHUNK_SIZE:
+                chunks[-1] += bytes([JUMP, len(chunks), 0x00, 0x00])
+                chunks.append(bytearray())
+            c = chunks[-1]
+            where.append((len(chunks) - 1, len(c)))
+            if it[0] == "L":
+                c += units[it[1]]
+            else:
+                sc, addr = where[it[1]]
+                if it[2] < 256:
+                    c += bytes([CALL8, sc, addr & 0xff, addr >> 8, it[2]])
+                else:
+                    c += bytes([CALL16, sc, addr & 0xff, addr >> 8, it[2] & 0xff, it[2] >> 8])
+        entries.append(where[0])
+        if has_loop:
+            sc, addr = where[loop_item]
+            chunks[-1] += bytes([JUMP, sc, addr & 0xff, addr >> 8])
+        else:
+            chunks[-1] += bytes([OP_STOP])
+    return chunks, entries
+
+
+class PlayerModel:
+    """Executes the bytecode exactly as driver/furplayer does; returns the writes of each tick."""
+
+    def __init__(self, chunks, entries, waves, hz, anticlick):
+        self.chunks = chunks
+        self.waves = waves
+        self.ac = AntiClick(anticlick)
+        self.k = anticlick_step(hz)
+        self.ctx = [{"pc": e, "stack": [], "idle": 0} for e in entries]
+        self.playing = True
 
     def tick(self):
-        self.div_counter -= 1
-        if self.div_counter <= 0:
-            fx = self.state['effect']
-            spd = self.state['speed']
-            p1 = self.state['param1']
-            p2 = self.state['param2']
-            
-            for i in range(spd + 1):
-                if fx == 130: # DIV_WS_FADE
-                    self.output[self.pos] = self.wave1[self.pos] + (((self.wave2[self.pos] - self.wave1[self.pos]) * self.stage) >> 9)
-                    self.pos += 1
-                    if self.pos >= self.width:
-                        self.pos = 0
-                        self.stage += 1 + p1
-                        if self.stage > 512:
-                            self.stage = 512
-                elif fx == 131: # DIV_WS_PING_PONG
-                    self.output[self.pos] = self.wave1[self.pos] + (((self.wave2[self.pos] - self.wave1[self.pos]) * self.stage) >> 8)
-                    self.pos += 1
-                    if self.pos >= self.width:
-                        self.pos = 0
-                        if self.stage_dir:
-                            self.stage -= 1 + p1
-                            if self.stage <= 0:
-                                self.stage_dir = False
-                                self.stage = 0
-                        else:
-                            self.stage += 1 + p1
-                            if self.stage >= 256:
-                                self.stage_dir = True
-                                self.stage = 256
-                elif fx == 132: # DIV_WS_OVERLAY
-                    self.output[self.pos] += self.wave2[self.pos]
-                    if self.output[self.pos] >= self.height:
-                        self.output[self.pos] -= self.height
-                    self.pos += 1
-                    if self.pos >= self.width:
-                        self.pos = 0
-                elif fx == 133: # DIV_WS_NEGATIVE_OVERLAY
-                    self.output[self.pos] -= self.wave2[self.pos]
-                    if self.output[self.pos] < 0:
-                        self.output[self.pos] += self.height
-                    self.pos += 1
-                    if self.pos >= self.width:
-                        self.pos = 0
-                elif fx == 135: # DIV_WS_MIX
-                    self.output[self.pos] = (self.wave1[self.pos] + self.wave2[(self.pos + self.stage) % self.width]) >> 1
-                    self.pos += 1
-                    if self.pos >= self.width:
-                        self.pos = 0
-                        self.stage += p1
-                        while self.stage >= self.width:
-                            self.stage -= self.width
-
-            self.div_counter = max(1, self.state['rateDivider'])
-
-        # Invert wave (nibble ^= 15) for Game Boy
-        packed = []
-        for s in range(0, 32, 2):
-            n1 = (max(0, min(15, self.output[s])) ^ 15) & 0x0F
-            n2 = (max(0, min(15, self.output[s+1])) ^ 15) & 0x0F
-            packed.append((n1 << 4) | n2)
-        return packed
-
-def bake_wavesynths(song_info, fur_file):
-    bin_ins, bin_waves = parse_fur_binary(fur_file)
-    waves = song_info['wavetables']
-    sub = song_info.get('subsong')
-    used_ins = set()
-    if sub:
-        for ch_idx in range(4):
-            for pat_idx in sub['orders'][ch_idx]:
-                for r in sub['patterns'].get((pat_idx, ch_idx), []):
-                    if r.get('ins') is not None and r['ins'] != 255:
-                        used_ins.add(r['ins'])
-    
-    for ins_idx, ins in enumerate(song_info['instruments']):
-        if ins_idx >= len(bin_ins):
-            break
-        if ins_idx not in used_ins:
-            continue
-        ws = bin_ins[ins_idx]['ws']
-        if not ws or not ws['enabled'] or ws['effect'] == 0:
-            continue
-        if ws['wave1'] >= len(bin_waves) or ws['wave2'] >= len(bin_waves):
-            continue
-            
-        print(f"[*] Baking WaveSynth for Ins {ins_idx} ('{ins['name']}'): effect={ws['effect']}, spd={ws['speed']}")
-        w1 = bin_waves[ws['wave1']]['samples']
-        w2 = bin_waves[ws['wave2']]['samples']
-        sim = DivWaveSynthSim(w1, w2, ws)
-        
-        frame_indices = []
-        seen = {}
-        loop_start = None
-        max_ticks = 48
-        
-        for t in range(max_ticks):
-            packed_frame = sim.tick()
-            state_key = (sim.pos, sim.stage, sim.stage_dir, tuple(sim.output))
-            if state_key in seen:
-                loop_start = seen[state_key]
+        w = []
+        if not self.playing:
+            return w
+        self.ac.tick(self.k)
+        for c in self.ctx:
+            if not self.playing:
                 break
-            seen[state_key] = t
-            
-            # Find in waves or append
-            if packed_frame in waves:
-                w_idx = waves.index(packed_frame)
+            if c["idle"]:
+                c["idle"] -= 1
             else:
-                w_idx = len(waves)
-                waves.append(packed_frame)
-            frame_indices.append(w_idx)
-            
-        if loop_start is None:
-            loop_start = len(frame_indices) - 1
-            
-        ins['wave_macro'] = {
-            'len': len(frame_indices),
-            'loop': loop_start,
-            'values': frame_indices
-        }
-        print(f"    -> Generated {len(frame_indices)} frames (loop={loop_start}), master wavetables now: {len(waves)}")
+                self.run(c, w)
+        return w
 
-def encode_pattern(rows):
-    """
-    Encode rows into bytecode with RLE empty rows:
-    - 0x80 | count: skip count empty rows (1..127)
-    - mask byte:
-      bit 0: note present (1 byte follows)
-      bit 1: ins present (1 byte follows)
-      bit 2: vol present (1 byte follows)
-      bit 3: fx1 present (2 bytes follow: type, val)
-      bit 4: fx2 present (2 bytes follow: type, val)
-    - 0xFF: FUR_PATTERN_END
-    """
-    bytes_out = []
-    rle_empty = 0
+    def run(self, c, w):
+        def byte():
+            ch, o = c["pc"]
+            c["pc"] = (ch, o + 1)
+            return self.chunks[ch][o]
+        while True:
+            op = byte()
+            if op < 0x32:
+                a = {OP_NR33: 0x1d, OP_NR34: 0x1e}.get(op, 0x10 + op)
+                v = byte()
+                w.append((a, v))
+                self.ac.write(a, v)
+            elif OP_END <= op < 0x80:
+                c["idle"] = op & 0x3f
+                st = c["stack"]
+                for f in st:
+                    f[2] -= 1
+                while st and st[-1][2] == 0:
+                    c["pc"] = tuple(st.pop()[:2])
+                return
+            elif op in (OP_WAVE, OP_WAVE | 1):
+                base = self.waves[((op & 1) << 8) | byte()]
+                r = self.ac.pos
+                var = base[16:] if r & 1 else base[:16]
+                w.append((0x1a, 0))
+                w += [(0x30 + i, var[(i + (r >> 1)) & 15]) for i in range(16)]
+            elif op == OP_ACRESET:
+                self.ac.pos = self.ac.cnt = 0
+            elif op == OP_STOP:
+                self.playing = False
+                return
+            elif op in (CALL8, CALL16):
+                ch = byte()
+                addr = byte() | (byte() << 8)
+                n = byte() | ((byte() << 8) if op == CALL16 else 0)
+                if len(c["stack"]) >= MAX_DEPTH:
+                    raise RuntimeError("call stack overflow")
+                c["stack"].append([*c["pc"], n])
+                c["pc"] = (ch, addr)
+            elif op == JUMP:
+                ch = byte()
+                c["pc"] = (ch, byte() | (byte() << 8))
+            elif op == SETRATE:
+                self.k = byte() | (byte() << 8)
+                byte(); byte(); byte()
+            elif op == ZOMBIE:
+                r, x, k = byte(), byte(), byte()
+                w.append((r, x))
+                w += [(r, v) for _ in range(k) for v in (0x09, 0x11, 0x08)]
+            else:
+                raise RuntimeError(f"bad opcode {op:#x} at {c['pc']}")
 
-    def flush_rle():
-        nonlocal rle_empty
-        while rle_empty > 0:
-            chunk = min(rle_empty, 127)
-            bytes_out.append(0x80 | chunk)
-            rle_empty -= chunk
 
-    for r in rows:
-        is_empty = (r['note'] == 0 and r['ins'] == 0xFF and r['vol'] == 0xFF and r['fx1'] == (0, 0) and r['fx2'] == (0, 0))
-        if is_empty:
-            rle_empty += 1
-            if rle_empty == 127:
-                flush_rle()
-        else:
-            flush_rle()
-            mask = 0
-            row_data = []
-            if r['note'] != 0:
-                mask |= 0x01
-                row_data.append(r['note'])
-            if r['ins'] != 0xFF:
-                mask |= 0x02
-                row_data.append(r['ins'])
-            if r['vol'] != 0xFF:
-                mask |= 0x04
-                row_data.append(r['vol'])
-            if r['fx1'] != (0, 0):
-                mask |= 0x08
-                row_data.append(r['fx1'][0])
-                row_data.append(r['fx1'][1])
-            if r['fx2'] != (0, 0):
-                mask |= 0x10
-                row_data.append(r['fx2'][0])
-                row_data.append(r['fx2'][1])
-            
-            bytes_out.append(mask)
-            bytes_out.extend(row_data)
+def compared_ticks(trace):
+    """Ticks to compare: all of them, or up to and including the FFxx stop tick."""
+    stops = [i for i, t in enumerate(trace.ticks) if not t.chip_ticked()]
+    return stops[0] + 1 if stops else len(trace.ticks)
 
-    flush_rle()
-    bytes_out.append(0xFF) # FUR_PATTERN_END
-    return bytes_out
 
-def generate_c_code(song_info, title="Song"):
-    ins_list = song_info['instruments']
-    waves = song_info['wavetables']
-    sub = song_info['subsong']
-    order_len = len(sub['orders'][0])
+def expected_writes(trace):
+    """Furnace's writes per tick (reset writes fold into tick 0), as the player must reproduce them."""
+    out = []
+    for ti, t in enumerate(trace.ticks):
+        ops = (list(trace.init) if ti == 0 else []) + t.ops
+        out.append([(o[1], o[2] & NR50_MASK if o[1] == 0x24 else o[2]) for o in ops if o[0] == "W"])
+    return out
 
-    lines = []
-    lines.append('/* Generated by fur2gb */')
-    lines.append('#include "fur_driver.h"')
-    lines.append('')
 
-    # Wavetables
-    lines.append(f'/* Wavetables: {len(waves)} */')
+def verify_model(trace, chunks, entries, waves, anticlick):
+    """Run the player model over every traced tick (all loops) and compare with Furnace."""
+    exp = expected_writes(trace)[:compared_ticks(trace)]
+    m = PlayerModel(chunks, entries, waves, trace.ticks[0].hz, anticlick)
+    for ti, e in enumerate(exp):
+        got = m.tick()
+        if got != e:
+            i = next(i for i in range(max(len(got), len(e)))
+                     if (got[i] if i < len(got) else None) != (e[i] if i < len(e) else None))
+            raise SystemExit(f"model mismatch at tick {ti} (order {trace.ticks[ti].order:02X} row "
+                             f"{trace.ticks[ti].row}), write {i}: player "
+                             f"{got[i] if i < len(got) else None}, Furnace {e[i] if i < len(e) else None}")
+    return len(exp)
+
+
+def ident(name):
+    s = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    return ("_" + s) if s[0].isdigit() else s
+
+
+def emit_c(out_dir: Path, name: str, song):
+    """Write <name>.c/.h and <name>_chunkN.c (autobanked) for a compiled song."""
+    chunks, entries, waves, hz, anticlick = (song[k] for k in ("chunks", "entries", "waves", "hz", "anticlick"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    files = []
+    wave_chunk = None
     if waves:
-        lines.append(f'static const uint8_t test_song_waves[{len(waves)}][16] = {{')
-        for w_idx, w in enumerate(waves):
-            hex_bytes = ', '.join(f'0x{b:02X}' for b in w)
-            lines.append(f'    /* Wave {w_idx:2d} */ {{ {hex_bytes} }},')
-        lines.append('};')
-    else:
-        lines.append('static const uint8_t test_song_waves[1][16] = {{ {0} }};')
-    lines.append('')
+        wave_chunk = len(chunks)
+        chunks = chunks + [b"".join(waves)]
+        if len(chunks[-1]) > CHUNK_SIZE:
+            raise SystemExit("wave pool exceeds one bank")
+    for k, c in enumerate(chunks):
+        sym = f"{name}_chunk{k}"
+        p = out_dir / f"{sym}.c"
+        lines = ["/* Generated by fur2gb - do not edit */", "#pragma bank 255", "#include <gbdk/platform.h>",
+                 "#include <stdint.h>", "", f"BANKREF({sym})", f"const uint8_t {sym}[{len(c)}] = {{"]
+        for o in range(0, len(c), 24):
+            lines.append("    " + ", ".join(f"0x{b:02X}" for b in c[o:o + 24]) + ",")
+        lines.append("};")
+        p.write_text("\n".join(lines) + "\n")
+        files.append(p)
+    lines = ["/* Generated by fur2gb - do not edit */", "#pragma bank 255", "#include \"furplayer.h\"", ""]
+    for i in range(len(chunks)):
+        lines += [f"BANKREF_EXTERN({name}_chunk{i})", f"extern const uint8_t {name}_chunk{i}[];"]
+    lines += ["", f"static const fur_chunk_t {name}_chunks[{len(chunks)}] = {{"]
+    for i in range(len(chunks)):
+        lines.append(f"    {{ BANK({name}_chunk{i}), {name}_chunk{i} }},")
+    lines += ["};", "", f"BANKREF({name})", f"const fur_song_t {name} = {{",
+              f"    {len(chunks)}, /* chunks */",
+              f"    {wave_chunk if wave_chunk is not None else 0xFF}, /* wave pool chunk */",
+              f"    {1 if anticlick else 0}, /* anti-click */",
+              f"    {anticlick_step(hz)}, /* anti-click step at {hz:g} Hz */",
+              f"    {tick_period(hz)}UL, /* tick period in 1/16 cycles */",
+              "    { " + ", ".join(f"{{ {c}, {o} }}" for c, o in entries) + " }, /* stream entry points */",
+              f"    {name}_chunks",
+              "};", ""]
+    p = out_dir / f"{name}.c"
+    p.write_text("\n".join(lines))
+    files.append(p)
+    h = out_dir / f"{name}.h"
+    h.write_text(f"/* Generated by fur2gb */\n#pragma once\n#include \"furplayer.h\"\n"
+                 f"BANKREF_EXTERN({name})\nextern const fur_song_t {name};\n")
+    files.append(h)
+    return files
 
-    # Instrument Macros
-    lines.append('/* Instrument Macros */')
-    macro_id = 0
-    ins_macro_refs = []
-    for ins_idx, ins in enumerate(ins_list):
-        refs = {'vol': 'NULL', 'arp': 'NULL', 'duty': 'NULL', 'wave': 'NULL'}
-        for m_name in ('vol', 'arp', 'duty', 'wave'):
-            m = ins[f'{m_name}_macro']
-            if m and m['len'] > 0:
-                var_vals = f'macro_{macro_id}_vals'
-                var_mac  = f'macro_{macro_id}'
-                vals_str = ', '.join(str(v if v <= 127 else v - 256) for v in m['values'])
-                lines.append(f'static const int8_t {var_vals}[{m["len"]}] = {{ {vals_str} }};')
-                lines.append(f'static const fur_macro_t {var_mac} = {{ {m["len"]}, 0x{m["loop"]:02X}, {var_vals} }};')
-                refs[m_name] = f'&{var_mac}'
-                macro_id += 1
-        ins_macro_refs.append(refs)
-    lines.append('')
 
-    # Instruments Table
-    lines.append(f'/* Instruments: {len(ins_list)} */')
-    if ins_list:
-        lines.append(f'static const fur_instrument_t test_song_instruments[{len(ins_list)}] = {{')
-        for idx, ins in enumerate(ins_list):
-            r = ins_macro_refs[idx]
-            lines.append(f'    /* {idx:2d}: {ins["name"]} */ {{ {ins["volume"]}, {ins["direction"]}, {ins["length"]}, {ins["sound_len"]}, {ins["soft_env"]}, {r["vol"]}, {r["arp"]}, {r["duty"]}, {r["wave"]} }},')
-        lines.append('};')
-    else:
-        lines.append('static const fur_instrument_t test_song_instruments[1] = { { 15, 0, 2, 64, 0, NULL, NULL, NULL, NULL } };')
-    lines.append('')
+def compile_song(fur: Path, loops: int, subsong=None, furnace=furtrace.DEFAULT_FURNACE):
+    """Trace, convert and verify against the player model. Returns (trace, song dict)."""
+    trace = furtrace.run(fur, loops, furnace=furnace, subsong=subsong)
+    ticks, waves, loop_start, anticlick = analyse(trace)
+    streams = []
+    raw = 0
+    for s in range(NSTREAMS):
+        units, loop_unit = build_units([t[s] for t in ticks], loop_start)
+        items, size, loop_item = compress(units, loop_unit)
+        raw += sum(len(u) for u in units)
+        streams.append((units, items, size, loop_item))
+    chunks, entries = layout(streams, loop_start is not None)
+    verified = verify_model(trace, chunks, entries, waves, anticlick)
+    song = dict(chunks=chunks, entries=entries, waves=waves, hz=trace.ticks[0].hz, anticlick=anticlick,
+                ticks=len(ticks), loop_tick=loop_start, verified=verified, raw=raw,
+                bytes=sum(len(c) for c in chunks), wave_bytes=32 * len(waves),
+                hzs=sorted({t.hz for t in trace.ticks}))
+    return trace, song
 
-    # Patterns
-    lines.append('/* Channel Patterns */')
-    # Unique patterns map: bytes tuple -> pat_id
-    pat_map = [{}, {}, {}, {}]
-    pat_order_lists = [[], [], [], []]
-
-    for ch in range(4):
-        for ord_idx in range(order_len):
-            rows = sub['patterns'].get((ord_idx, ch), [])
-            encoded = tuple(encode_pattern(rows))
-            if encoded not in pat_map[ch]:
-                p_id = len(pat_map[ch])
-                pat_map[ch][encoded] = p_id
-                # Output array
-                c_bytes = ', '.join(f'0x{b:02X}' for b in encoded)
-                lines.append(f'static const uint8_t pat_ch{ch}_{p_id}[] = {{ {c_bytes} }};')
-            else:
-                p_id = pat_map[ch][encoded]
-            pat_order_lists[ch].append(p_id)
-        lines.append('')
-
-    # Pattern Pointers Table
-    for ch in range(4):
-        total_pats = len(pat_map[ch])
-        lines.append(f'static const uint8_t * const patterns_ch{ch+1}[{total_pats}] = {{')
-        for p_id in range(total_pats):
-            lines.append(f'    pat_ch{ch}_{p_id},')
-        lines.append('};')
-        lines.append('')
-
-    # Order Lists
-    for ch in range(4):
-        ords = ', '.join(str(p) for p in pat_order_lists[ch])
-        lines.append(f'static const uint8_t order_ch{ch+1}[{order_len}] = {{ {ords} }};')
-    lines.append('')
-
-    # Speeds Table
-    speeds_str = ', '.join(str(s) for s in sub['speeds'])
-    lines.append(f'static const uint8_t song_speeds[{len(sub["speeds"])}] = {{ {speeds_str} }};')
-    lines.append('')
-
-    # Master Song Struct
-    lines.append('const fur_song_t test_song = {')
-    lines.append(f'    "{title}",')
-    lines.append(f'    {sub["tick_rate"]},')
-    lines.append(f'    {sub.get("virtual_tempo_n", 150)},')
-    lines.append(f'    {sub.get("virtual_tempo_d", 150)},')
-    lines.append(f'    {len(sub["speeds"])},')
-    lines.append('    song_speeds,')
-    lines.append(f'    {sub["pattern_len"]},')
-    lines.append(f'    {order_len},')
-    lines.append('    0, /* loop order */')
-    lines.append('    order_ch1,')
-    lines.append('    order_ch2,')
-    lines.append('    order_ch3,')
-    lines.append('    order_ch4,')
-    lines.append('    patterns_ch1,')
-    lines.append('    patterns_ch2,')
-    lines.append('    patterns_ch3,')
-    lines.append('    patterns_ch4,')
-    lines.append(f'    {len(waves)},')
-    lines.append('    test_song_waves,')
-    lines.append(f'    {len(ins_list)},')
-    lines.append('    test_song_instruments')
-    lines.append('};')
-    lines.append('')
-
-    return '\n'.join(lines)
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Furnace .fur to Game Boy C tables")
-    parser.add_argument("input", help="Path to input .fur song")
-    parser.add_argument("-o", "--output", default="bin/song_data.c", help="Output .c file path")
-    parser.add_argument("--furnace", default=r"tools/bin/furnace.exe", help="Path to furnace.exe")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("fur", type=Path)
+    ap.add_argument("-o", "--out", type=Path, default=Path("build/songs"), help="output directory")
+    ap.add_argument("-n", "--name", help="C symbol name (default: from file name)")
+    ap.add_argument("--loops", type=int, default=4, help="loops to trace when looking for the steady loop")
+    ap.add_argument("--subsong", type=int)
+    ap.add_argument("--furnace", type=Path, default=furtrace.DEFAULT_FURNACE)
+    a = ap.parse_args()
+    name = ident(a.name or a.fur.stem)
+    trace, song = compile_song(a.fur, a.loops, a.subsong, a.furnace)
+    files = emit_c(a.out, name, song)
+    loop = f"loops at tick {song['loop_tick']}" if song["loop_tick"] is not None else "no loop (stops)"
+    print(f"{name}: {song['ticks']} ticks, {loop}, {song['bytes']} B stream (raw {song['raw']} B) "
+          f"+ {song['wave_bytes']} B waves, anti-click {'on' if song['anticlick'] else 'off'}, "
+          f"{'/'.join(f'{h:g}' for h in song['hzs'])} Hz; "
+          f"player model matches Furnace on all {song['verified']} traced ticks")
+    for f in files:
+        print("  ", f)
 
-    furnace_exe = os.path.abspath(args.furnace)
-    if not os.path.exists(furnace_exe):
-        # Fallback check
-        alt_exe = os.path.join(os.path.dirname(__file__), "bin", "furnace.exe")
-        if os.path.exists(alt_exe):
-            furnace_exe = alt_exe
-        else:
-            print(f"Error: furnace.exe not found at {furnace_exe}", file=sys.stderr)
-            sys.exit(1)
-
-    fur_file = os.path.abspath(args.input)
-    temp_txt = os.path.abspath("temp_export.txt")
-
-    print(f"[*] Exporting text from {fur_file} via {furnace_exe}...")
-    cmd = [furnace_exe, "-txtout", temp_txt, fur_file]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if not os.path.exists(temp_txt):
-        print("Furnace error:", res.stderr, file=sys.stderr)
-        sys.exit(1)
-
-    with open(temp_txt, "r", encoding="utf-8", errors="ignore") as f:
-        txt_content = f.read()
-    if os.path.exists(temp_txt):
-        os.remove(temp_txt)
-
-    print("[*] Parsing exported song data...")
-    song_info = parse_txt_export(txt_content)
-    base_name = os.path.splitext(os.path.basename(fur_file))[0]
-
-    print("[*] Baking dynamic WaveSynth tables if present...")
-    bake_wavesynths(song_info, fur_file)
-
-    print("[*] Generating Game Boy C tables...")
-    c_code = generate_c_code(song_info, title=base_name)
-
-    out_path = os.path.abspath(args.output)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(c_code)
-
-    print(f"[+] Successfully wrote song data to {out_path}")
 
 if __name__ == "__main__":
     main()
