@@ -7,20 +7,26 @@ Plays Furnace Game Boy songs on real hardware, identical to Furnace.
 Instead of re-implementing Furnace's playback engine on the Game Boy, **Furnace itself is the
 compiler**:
 
-1. `tools/furtrace.py` runs Furnace 0.6.8.2 (the release the songs are written in) with a small
-   patch (`tools/furnace_trace.patch`) that logs every register write its GB backend makes, tick by
+1. `tools/furtrace.py` checks that the song uses exactly one Game Boy chip. It then runs Furnace
+   0.6.8.2 (the release the songs are written in) with a small patch
+   (`tools/furnace_trace.patch`) that logs every register write its GB backend makes, tick by
    tick, plus the loop points.
-2. `tools/fur2gb.py` turns that log into a compact bytecode stream: register writes, empty-tick
-   runs, wave loads and `CALL`s back into earlier data for repeated passages (LZ-style), split into
-   16 KB banks. It looks for the first loop pass that repeats unchanged and jumps back to it.
-3. `driver/furplayer` (bank 0, the tick routine in assembly) replays the stream.
+2. `tools/fur2gb.py` turns that log into compact bytecode and splits each tick's writes into
+   5 streams, in the order Furnace makes them:
+   - A: writes made while Furnace processes the row (instrument, volume, panning...);
+   - B0-B3: writes made by the chip's `tick()` for channel 1-4.
+
+   Repeated passages of each stream become `CALL`s back into earlier data (LZ-style), and
+   Furnace's zombie-mode volume bursts become one op. The streams are split into 16 KB banks. The
+   converter finds the loop pass that repeats unchanged and jumps back to it.
+3. `driver/furplayer` replays the streams. Its tick routine is in assembly and lives in bank 0.
 
 Every effect, macro (ADSR/LFO included), WaveSynth, hardware sequence, compat flag, groove and tick
 rate is therefore exactly Furnace's behaviour, with no per-feature porting.
 
 The one piece of Furnace state the player computes itself is the GB backend's **anti-click** wave
 rotation. When Furnace rewrites wave RAM it rotates the wave by how far the wave channel has
-played, which depends on time, so it differs on every loop. The player runs the same integer
+played, which depends on time, so it differs on every loop. The player uses the same integer
 arithmetic as `DivPlatformGB::tick()`:
 
 ```
@@ -34,21 +40,29 @@ reports at every single wave rewrite.
 
 `tests/verify_rom.py song.fur ...` proves the ROM matches Furnace:
 
-1. Furnace plays the song for 4 loops and records every register write (the reference).
+1. Furnace plays the song for 4 or more loops and records every register write (the reference).
 2. The converter's Python model of the player must reproduce every write of every tick.
 3. A test ROM is built with GBDK and run headless in Mesen. Every write to `$FF10-$FF3F` made by
    each `fur_tick()` call is captured.
 4. The ROM's writes must equal Furnace's, in the same order and tick by tick, for all traced
-   ticks: the intro, the first loop, and repeats 2-4 (which exercise the loop jump and the
+   ticks: the intro, the first loop, and the repeats (which exercise the loop jump and the
    anti-click state carried across loops).
 
-The only intentional difference is that **NR50's VIN bits are cleared** (Furnace writes `$FF`,
-the player writes `$77`). Furnace's emulated chip ignores VIN, so its audio is unchanged, and on
-hardware VIN enabled with nothing driving it can add noise.
+Intentional differences and limits:
 
-Not covered by the write comparison: when inside a tick the writes land. Furnace applies one write
-per 16 cycles at the start of the tick; the player takes about 30-100 cycles per write. The GB's
-512 Hz frame sequencer (envelope, length and sweep clocks) also runs freely from DIV on hardware.
+- **NR50's VIN bits are cleared** (Furnace writes `$FF`, the player `$77`). Furnace's emulated chip
+  ignores VIN, so its audio is unchanged, and on hardware VIN enabled with nothing driving it can
+  add noise.
+- **FFxx (stop)**: the player stops on the stop tick. Furnace sometimes runs one more chip tick
+  after it, depending on where its audio buffer ends, so that tick isn't stable in Furnace either.
+- **Virtual tempo that doesn't divide evenly** (for example 127/150): Furnace advances rows on the
+  virtual tempo clock but runs macros every real tick, so one pass of the song lasts a fractional
+  number of ticks. The song only repeats exactly after many passes (up to N of N/150). The
+  converter refuses such songs unless you pass `--approx-loop`. With it, the intro and first pass
+  are exact and the stream then jumps back, so later passes can be one tick off in places.
+- **Timing within a tick** isn't covered by the write comparison. Furnace applies a tick's writes
+  16 cycles apart; the player takes about 30-100 cycles per write. The GB's 512 Hz frame sequencer
+  (envelope, length and sweep clocks) runs freely from DIV on hardware.
 
 ## Usage
 
@@ -67,6 +81,10 @@ fur_play(&my_song, BANK(my_song));
 fur_frame();      // plays 0-2 ticks so the song keeps its own tick rate (60 Hz, 57.6 Hz, ...)
 // or drive fur_tick() yourself at the song's tick rate
 ```
+
+CPU: `fur_tick()` takes about 1.5-6k cycles on average and up to about 12k on the busiest ticks,
+measured on Pocket Dash's songs. For comparison, Pocket Dash's hUGEDriver ISR is about 4k on
+average and 14k at most.
 
 ## Rebuilding the reference Furnace
 

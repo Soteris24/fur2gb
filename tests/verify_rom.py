@@ -101,6 +101,7 @@ def main():
     ap.add_argument("--loops", type=int, default=4)
     ap.add_argument("--model", default="Gameboy", choices=["Gameboy", "GameboyColor"])
     ap.add_argument("--furnace", type=Path, default=furtrace.DEFAULT_FURNACE, help="traced Furnace build")
+    ap.add_argument("--approx-loop", action="store_true", help="see tools/fur2gb.py --approx-loop")
     a = ap.parse_args()
     results = []
     for fur in a.songs:
@@ -109,17 +110,18 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         t = time.time()
         try:
-            trace, info = fur2gb.compile_song(fur, a.loops, furnace=a.furnace)
+            trace, info = fur2gb.compile_song(fur, a.loops, furnace=a.furnace, approx_loop=a.approx_loop)
         except SystemExit as e:
             results.append((name, f"CONVERT FAIL: {e}", None, None))
             print(f"{name}: CONVERT FAIL: {e}", flush=True)
             continue
-        exp = fur2gb.expected_writes(trace)[:fur2gb.compared_ticks(trace)]
+        exp = fur2gb.expected_writes(trace)[:fur2gb.compared_ticks(trace, info["exact_ticks"])]
         rom = build_rom(name, info, out)
         got, cost = run_mesen(rom, len(exp), a.model)
         err = compare(name, trace, exp, got)
         nw = sum(len(x) for x in exp)
-        status = err or f"PASS {len(exp)} ticks / {nw} writes identical"
+        status = err or (f"PASS {len(exp)} ticks / {nw} writes identical"
+                         + (" (exact part of an --approx-loop song)" if info["exact_ticks"] else ""))
         cyc = f"max {max(cost)} avg {sum(cost) // len(cost)}" if cost else "-"
         results.append((name, status, info, cyc))
         print(f"{name}: {status}; {info['bytes'] + info['wave_bytes']} B; fur_tick cycles {cyc}; "

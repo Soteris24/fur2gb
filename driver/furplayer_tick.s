@@ -124,7 +124,7 @@ wr_nr33:				; 30 vv: NR33, remembered for the ch3 period
 	ldh	(0x1d), a
 	ld	(_fur_nr33), a
 	jr	next
-wr_nr34:				; 31 vv: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
+wr_nr34:				; 31 vv qq rl rh: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
 	ld	a, (hl+)
 	ldh	(0x1e), a
 	and	#7
@@ -137,24 +137,28 @@ wr_nr34:				; 31 vv: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
 	ld	a, #8
 	sbc	a, d
 	ld	d, a			; DE = new freq
-	ld	a, (_fur_ac_freq)
-	cp	e
-	jr	nz, 1$
-	ld	a, (_fur_ac_freq + 1)
-	cp	d
-	jr	z, next			; unchanged
-1$:	ld	a, e
+	ld	a, (hl+)		; step / freq, step % freq (from the converter)
+	ld	(_fur_ac_q), a
+	ld	a, (hl+)
+	ld	(_fur_ac_r), a
+	ld	a, (hl+)
+	ld	(_fur_ac_r + 1), a
+	ld	a, e
 	ld	(_fur_ac_freq), a
 	ld	a, d
 	ld	(_fur_ac_freq + 1), a
-	push	hl
-	; cnt may exceed the new freq: pos += cnt / freq, cnt %= freq (pos is only read after the
+	; cnt may exceed a lower freq: pos += cnt / freq, cnt %= freq (pos is only read after the
 	; next tick's step, where Furnace's single division gives the same total)
+	ld	a, (_fur_ac_cnt)
+	sub	e
+	ld	a, (_fur_ac_cnt + 1)
+	sbc	a, d
+	jp	c, next			; cnt < freq
+	push	hl
 	ld	hl, #_fur_ac_cnt
 	ld	a, (hl+)
 	ld	h, (hl)
 	ld	l, a
-	push	de
 	call	div16
 	ld	a, c
 	ld	(_fur_ac_cnt), a
@@ -164,8 +168,6 @@ wr_nr34:				; 31 vv: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
 	add	a, l
 	and	#31
 	ld	(_fur_ac_pos), a
-	pop	de
-	call	ac_divstep
 	pop	hl
 	jp	next
 

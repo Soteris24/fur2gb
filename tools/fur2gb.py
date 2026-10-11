@@ -17,7 +17,8 @@ Splitting by channel lets repeated passages of each channel compress on their ow
 
 Stream bytecode (one tick of a stream = ops up to and including an END op):
     00-2F vv      write vv to $FF10+op (never NR33/NR34)
-    30 vv / 31 vv write NR33 / NR34 (the player tracks ch3's period for anti-click)
+    30 vv         write NR33 (the player tracks ch3's period for anti-click)
+    31 vv qq rl rh  write NR34; qq/rhrl = anti-click step / and % the new ch3 period
     40-7F         END: end of tick, then (op & 3F) more empty ticks for this stream
     80-81 ii      WAVE: NR30=0, then base wave (op&1)<<8|ii into wave RAM, anti-click rotated
     82            anti-click reset (phase reset macro)
@@ -115,6 +116,10 @@ class AntiClickMismatch(Exception):
     pass
 
 
+class NotSettled(Exception):
+    pass
+
+
 def canon_ticks(trace, anticlick_enabled):
     """Convert traced ticks to per-stream op bytes: a list of NSTREAMS-tuples of bytes."""
     ac = AntiClick(anticlick_enabled)
@@ -187,6 +192,9 @@ def canon_ticks(trace, anticlick_enabled):
                     v &= NR50_MASK
                 ac.write(a, v)
                 code = bytes([{0x1d: OP_NR33, 0x1e: OP_NR34}.get(a, a - 0x10), v])
+                if a == 0x1e:
+                    q, r = divmod(anticlick_step(hz), ac.freq())
+                    code += bytes([q & 0xff, r & 0xff, r >> 8])
                 o = owner(a)
                 i += 1
             if in_tick and o >= 0:
@@ -204,7 +212,7 @@ def split_ops(code: bytes):
     ops, i = [], 0
     while i < len(code):
         op = code[i]
-        n = 2 if op < 0x32 or op in (OP_WAVE, OP_WAVE | 1) else 1 if op == OP_ACRESET else 6 if op == SETRATE             else 4 if op == ZOMBIE else None
+        n = 5 if op == OP_NR34 else 2 if op < 0x32 or op in (OP_WAVE, OP_WAVE | 1) else 1 if op == OP_ACRESET             else 6 if op == SETRATE else 4 if op == ZOMBIE else None
         if n is None:
             raise ValueError(f"unexpected op {op:#x}")
         ops.append(code[i:i + n])
@@ -234,8 +242,10 @@ def pack_zombie(code: bytes) -> bytes:
     return bytes(out)
 
 
-def analyse(trace):
-    """Pick the anti-click model, canonicalise ticks and find the steady loop."""
+def analyse(trace, approx_loop=False):
+    """Pick the anti-click model, canonicalise ticks and find the steady loop.
+    Returns (ticks, waves, loop_start, anticlick, exact_ticks): the player matches Furnace for
+    exact_ticks ticks (None = forever)."""
     try:
         ticks, waves = canon_ticks(trace, True)
         anticlick = True
@@ -257,19 +267,28 @@ def analyse(trace):
         # depends on buffer boundaries, so the player stops here.
         if loops and loops[0] < stops[0]:
             raise SystemExit(f"song stops at tick {stops[0]} after looping at {loops}")
-        return ticks[:stops[0] + 1], waves, None, anticlick
+        return ticks[:stops[0] + 1], waves, None, anticlick, None
     if loops:
-        # body k = ticks[loops[k]:loops[k+1]]; find the first body that repeats unchanged to the end
-        bodies = [(loops[k], loops[k + 1]) for k in range(len(loops) - 1)]
-        for k in range(len(bodies) - 1):
-            s0, e0 = bodies[k]
-            if all(ticks[s:e] == ticks[s0:e0] for s, e in bodies[k + 1:]):
-                loop_start, end = s0, e0
-                break
-        if loop_start is None:
-            raise SystemExit(f"song does not settle into a repeating loop within {len(bodies)} loops "
-                             f"(loop ticks {loops}); trace more loops with --loops")
-    return ticks[:end], waves, loop_start, anticlick
+        # Find the earliest loop k and the fewest loop passes p such that ticks[loops[k]:loops[k+p]]
+        # repeats unchanged until the end of the trace (at least twice). p > 1 when the loop
+        # isn't a whole number of ticks (virtual tempo, grooves) and its length alternates.
+        n = len(loops) - 1  # complete passes traced
+        for p in range(1, n // 2 + 1):
+            for k in range(n - 2 * p + 1):
+                s0, e0 = loops[k], loops[k + p]
+                reps = [(loops[j], loops[j + p]) for j in range(k + p, n - p + 1, p)]
+                if reps and all(ticks[a:b] == ticks[s0:e0] for a, b in reps):
+                    return ticks[:e0], waves, s0, anticlick, None
+        if approx_loop and n >= 1:
+            # play intro + first pass exactly, then jump back to the loop start
+            return ticks[:loops[1]], waves, loops[0], anticlick, loops[1]
+        lengths = sorted({loops[k + 1] - loops[k] for k in range(n)})
+        raise NotSettled(f"song does not repeat exactly within {n} loops: one pass is {lengths} ticks"
+                         f" (virtual tempo or a groove that doesn't divide evenly into ticks), so"
+                         f" Furnace only repeats exactly after many passes. Use --approx-loop to"
+                         f" play the intro and first pass exactly and then jump back, or set the"
+                         f" song's virtual tempo so one pass is a whole number of ticks")
+    return ticks[:end], waves, loop_start, anticlick, None
 
 
 def build_units(ticks, loop_start):
@@ -417,6 +436,8 @@ class PlayerModel:
                 v = byte()
                 w.append((a, v))
                 self.ac.write(a, v)
+                if op == OP_NR34:
+                    byte(); byte(); byte()  # precomputed step / freq: the model divides itself
             elif OP_END <= op < 0x80:
                 c["idle"] = op & 0x3f
                 st = c["stack"]
@@ -458,10 +479,12 @@ class PlayerModel:
                 raise RuntimeError(f"bad opcode {op:#x} at {c['pc']}")
 
 
-def compared_ticks(trace):
-    """Ticks to compare: all of them, or up to and including the FFxx stop tick."""
+def compared_ticks(trace, exact_ticks=None):
+    """Ticks to compare: all of them, up to and including the FFxx stop tick, or the exact part
+    of an --approx-loop song."""
     stops = [i for i, t in enumerate(trace.ticks) if not t.chip_ticked()]
-    return stops[0] + 1 if stops else len(trace.ticks)
+    n = stops[0] + 1 if stops else len(trace.ticks)
+    return min(n, exact_ticks) if exact_ticks else n
 
 
 def expected_writes(trace):
@@ -473,9 +496,9 @@ def expected_writes(trace):
     return out
 
 
-def verify_model(trace, chunks, entries, waves, anticlick):
+def verify_model(trace, chunks, entries, waves, anticlick, exact_ticks=None):
     """Run the player model over every traced tick (all loops) and compare with Furnace."""
-    exp = expected_writes(trace)[:compared_ticks(trace)]
+    exp = expected_writes(trace)[:compared_ticks(trace, exact_ticks)]
     m = PlayerModel(chunks, entries, waves, trace.ticks[0].hz, anticlick)
     for ti, e in enumerate(exp):
         got = m.tick()
@@ -539,10 +562,21 @@ def emit_c(out_dir: Path, name: str, song):
     return files
 
 
-def compile_song(fur: Path, loops: int, subsong=None, furnace=furtrace.DEFAULT_FURNACE):
+def compile_song(fur: Path, loops: int, subsong=None, furnace=furtrace.DEFAULT_FURNACE, approx_loop=False):
     """Trace, convert and verify against the player model. Returns (trace, song dict)."""
-    trace = furtrace.run(fur, loops, furnace=furnace, subsong=subsong)
-    ticks, waves, loop_start, anticlick = analyse(trace)
+    try:
+        furtrace.check_gb_song(fur, furnace)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    while True:
+        trace = furtrace.run(fur, loops, furnace=furnace, subsong=subsong)
+        try:
+            ticks, waves, loop_start, anticlick, exact = analyse(trace, approx_loop and loops >= 64)
+            break
+        except NotSettled as e:
+            if loops >= 64:
+                raise SystemExit(str(e))
+            loops *= 2
     streams = []
     raw = 0
     for s in range(NSTREAMS):
@@ -551,9 +585,9 @@ def compile_song(fur: Path, loops: int, subsong=None, furnace=furtrace.DEFAULT_F
         raw += sum(len(u) for u in units)
         streams.append((units, items, size, loop_item))
     chunks, entries = layout(streams, loop_start is not None)
-    verified = verify_model(trace, chunks, entries, waves, anticlick)
+    verified = verify_model(trace, chunks, entries, waves, anticlick, exact)
     song = dict(chunks=chunks, entries=entries, waves=waves, hz=trace.ticks[0].hz, anticlick=anticlick,
-                ticks=len(ticks), loop_tick=loop_start, verified=verified, raw=raw,
+                ticks=len(ticks), loop_tick=loop_start, verified=verified, raw=raw, exact_ticks=exact,
                 bytes=sum(len(c) for c in chunks), wave_bytes=32 * len(waves),
                 hzs=sorted({t.hz for t in trace.ticks}))
     return trace, song
@@ -567,15 +601,18 @@ def main():
     ap.add_argument("--loops", type=int, default=4, help="loops to trace when looking for the steady loop")
     ap.add_argument("--subsong", type=int)
     ap.add_argument("--furnace", type=Path, default=furtrace.DEFAULT_FURNACE)
+    ap.add_argument("--approx-loop", action="store_true",
+                    help="for songs that never repeat exactly: exact intro and first pass, then loop")
     a = ap.parse_args()
     name = ident(a.name or a.fur.stem)
-    trace, song = compile_song(a.fur, a.loops, a.subsong, a.furnace)
+    trace, song = compile_song(a.fur, a.loops, a.subsong, a.furnace, a.approx_loop)
     files = emit_c(a.out, name, song)
     loop = f"loops at tick {song['loop_tick']}" if song["loop_tick"] is not None else "no loop (stops)"
     print(f"{name}: {song['ticks']} ticks, {loop}, {song['bytes']} B stream (raw {song['raw']} B) "
           f"+ {song['wave_bytes']} B waves, anti-click {'on' if song['anticlick'] else 'off'}, "
           f"{'/'.join(f'{h:g}' for h in song['hzs'])} Hz; "
-          f"player model matches Furnace on all {song['verified']} traced ticks")
+          f"player model matches Furnace on all {song['verified']} traced ticks"
+          + (" (exact until the first loop, then approximate)" if song["exact_ticks"] else ""))
     for f in files:
         print("  ", f)
 

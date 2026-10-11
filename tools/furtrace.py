@@ -85,6 +85,48 @@ def parse(path: Path) -> Trace:
     return Trace(init, ticks)
 
 
+def song_chips(fur: Path, furnace: Path = DEFAULT_FURNACE):
+    """The song's sound chips as [(name, id, {flag: value})], from Furnace's text export."""
+    with tempfile.TemporaryDirectory(prefix="fur2gb_") as tmp:
+        txt = Path(tmp) / "song.txt"
+        res = subprocess.run([str(furnace), "-noreport", "-loglevel", "error", "-txtout", str(txt),
+                              str(Path(fur).resolve())], capture_output=True, text=True)
+        if not txt.exists():
+            raise RuntimeError(f"furnace could not read {fur}: {res.stdout} {res.stderr}")
+        lines = txt.read_text(encoding="utf-8", errors="replace").splitlines()
+    chips = []
+    section = False
+    in_flags = False
+    for line in lines:
+        if line.startswith("# "):
+            section = line.strip() == "# Sound Chips"
+            continue
+        if not section:
+            continue
+        if line.startswith("- "):
+            chips.append([line[2:].strip(), None, {}])
+        elif line.strip().startswith("- id:") and chips:
+            chips[-1][1] = int(line.split(":")[1], 16)
+        elif line.strip() == "```":
+            in_flags = not in_flags
+        elif in_flags and "=" in line and chips:
+            k, v = line.strip().split("=", 1)
+            chips[-1][2][k] = v
+    return [tuple(c) for c in chips]
+
+
+def check_gb_song(fur: Path, furnace: Path = DEFAULT_FURNACE):
+    """Raise ValueError unless the song uses exactly one Game Boy chip the player supports."""
+    chips = song_chips(fur, furnace)
+    names = ", ".join(c[0] for c in chips) or "none"
+    if len(chips) != 1 or chips[0][1] != 0x06:
+        raise ValueError(f"{Path(fur).name} is not a Game Boy song (sound chips: {names})")
+    if chips[0][2].get("chipType") == "3":
+        raise ValueError(f"{Path(fur).name} uses the Game Boy Advance (native) model, which a Game Boy "
+                         f"can't play (64-sample waves); pick a DMG or CGB model in the chip settings")
+    return chips[0]
+
+
 def run(fur: Path, loops: int, furnace: Path = DEFAULT_FURNACE, subsong: int | None = None,
         keep: Path | None = None) -> Trace:
     """Render `fur` for `loops` loops with the traced Furnace and return the parsed trace."""
