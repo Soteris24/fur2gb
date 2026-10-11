@@ -571,10 +571,11 @@ def compile_song(fur: Path, loops: int, subsong=None, furnace=furtrace.DEFAULT_F
     while True:
         trace = furtrace.run(fur, loops, furnace=furnace, subsong=subsong)
         try:
-            ticks, waves, loop_start, anticlick, exact = analyse(trace, approx_loop and loops >= 64)
+            limit = 16 if approx_loop else 64
+            ticks, waves, loop_start, anticlick, exact = analyse(trace, approx_loop and loops >= limit)
             break
         except NotSettled as e:
-            if loops >= 64:
+            if loops >= limit:
                 raise SystemExit(str(e))
             loops *= 2
     streams = []
