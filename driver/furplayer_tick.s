@@ -14,17 +14,24 @@
 
 	.module furplayer_tick
 
-	.globl	_fur_playing, _fur_ctx, _fur_chunks, _fur_wave_bank, _fur_wave_ptr
+	.globl	_fur_playing, _fur_wave_bank, _fur_wave_ptr
 	.globl	_fur_ac_on, _fur_ac_step, _fur_ac_cnt, _fur_ac_pos, _fur_ac_freq, _fur_nr33
 	.globl	_fur_period, _fur_ac_q, _fur_ac_r, _fur_mute
 	.globl	__current_bank
 
 	rROMB0 = 0x2000
 	STREAMS = 5
-	CTX_SIZE = 25		; idle, bank, ptr lo, ptr hi, depth, 4 frames of 5 bytes
+	FRAMES = 2		; call depth: FUR_STACK_DEPTH in furplayer.h, MAX_DEPTH in fur2gb.py
+	CTX_SIZE = 5 + 5 * FRAMES	; idle, bank, ptr lo, ptr hi, depth, frames of 5 bytes
 	CTX_DEPTH = 4
+	CHUNKS = 8		; FUR_MAX_CHUNKS
 
+	; the player's state (106 bytes); a game short of WRAM can put this area in _HRAM
 	.area	_DATA
+_fur_ctx::
+	.ds	STREAMS * CTX_SIZE
+_fur_chunks::			; bank, ptr lo, ptr hi
+	.ds	CHUNKS * 3
 fur_cur:			; context of the stream being run
 	.ds	2
 fur_bank:			; bank of the stream being run

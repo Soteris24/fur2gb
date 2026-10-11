@@ -23,9 +23,9 @@
 #define FUR_API
 #endif
 
-#define FUR_MAX_CHUNKS 32   /* 16 KB each */
+#define FUR_MAX_CHUNKS 8    /* 16 KB each: CHUNKS in furplayer_tick.s, MAX_CHUNKS in fur2gb.py */
 #define FUR_STREAMS 5       /* A (row commands), B0-B3 (per-channel tick): NSTREAMS in fur2gb.py */
-#define FUR_STACK_DEPTH 4   /* must match MAX_DEPTH in tools/fur2gb.py */
+#define FUR_STACK_DEPTH 2   /* FRAMES in furplayer_tick.s, MAX_DEPTH in fur2gb.py */
 #define FUR_CTX_SIZE (5 + FUR_STACK_DEPTH * 5)
 
 typedef struct {

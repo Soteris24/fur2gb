@@ -44,7 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import furtrace  # noqa: E402
 
 CHUNK_SIZE = 16384
-MAX_DEPTH = 4          # player call stack size per stream
+MAX_DEPTH = 2          # player call stack size per stream (FUR_STACK_DEPTH in furplayer.h)
+MAX_CHUNKS = 8         # FUR_MAX_CHUNKS in furplayer.h, wave pool included
 NSTREAMS = 5           # A, B0..B3
 OP_NR33, OP_NR34 = 0x30, 0x31
 OP_END = 0x40
@@ -531,6 +532,8 @@ def emit_c(out_dir: Path, name: str, song, bank_for=None, include="furplayer.h")
         chunks = chunks + [b"".join(waves)]
         if len(chunks[-1]) > CHUNK_SIZE:
             raise SystemExit("wave pool exceeds one bank")
+    if len(chunks) > MAX_CHUNKS:
+        raise SystemExit(f"song needs {len(chunks)} 16 KB chunks, the player has room for {MAX_CHUNKS}")
     for k, c in enumerate(chunks):
         sym = f"{name}_chunk{k}"
         p = out_dir / f"{sym}.c"

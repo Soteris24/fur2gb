@@ -6,10 +6,8 @@
 /* State shared with furplayer_tick.s (keep names and sizes in sync) */
 uint8_t fur_playing;
 uint8_t fur_mute;
-/* per stream: idle ticks, bank, ptr lo, ptr hi, call depth, then frames of
-   {bank, ptr lo, ptr hi, units lo, units hi} */
-uint8_t fur_ctx[FUR_STREAMS * FUR_CTX_SIZE];
-fur_chunk_t fur_chunks[FUR_MAX_CHUNKS];
+/* fur_ctx (per stream: idle ticks, bank, ptr lo, ptr hi, call depth, then frames of
+   {bank, ptr lo, ptr hi, units lo, units hi}) and fur_chunks are in furplayer_tick.s */
 uint8_t fur_wave_bank;
 const uint8_t *fur_wave_ptr;
 uint8_t fur_ac_on;
