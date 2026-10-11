@@ -31,7 +31,8 @@ def main():
         rom = (work / "song.gb").resolve()  # lcc can't take spaces in the output path
         cmd = [str(GBDK / "bin" / "lcc.exe"), f"-I{ROOT / 'driver'}", "-Wl-yt0x19", "-autobank", "-Wl-yoA",
                f"-Wm-yn{name[:15].upper()}", "-o", str(rom), str(ROOT / "tests" / "rom" / "listen.c"),
-               str(ROOT / "driver" / "furplayer.c"), str(ROOT / "driver" / "furplayer_tick.s")]
+               str(ROOT / "driver" / "furplayer.c"), str(ROOT / "driver" / "furplayer_core.c"),
+               str(ROOT / "driver" / "furplayer_tick.s")]
         cmd += [str(f) for f in files if f.suffix == ".c"]
         res = subprocess.run(cmd, capture_output=True, text=True, cwd=work)
         if res.returncode != 0 or not rom.exists():

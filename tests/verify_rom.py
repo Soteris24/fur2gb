@@ -31,14 +31,15 @@ MESEN = Path(os.environ.get("MESEN", r"C:\Users\soter\OneDrive\Documents\Mesen.e
 BUILD = ROOT / "build" / "verify"
 
 
-def build_rom(name: str, song, out: Path) -> Path:
+def build_rom(name: str, song, out: Path, mute: int = 0) -> Path:
     gen = out / "gen"
     files = fur2gb.emit_c(gen, "fur_test_song", song)
     rom = out / "furtest.gb"
     srcs = [ROOT / "tests" / "rom" / "main.c", ROOT / "driver" / "furplayer.c",
-            ROOT / "driver" / "furplayer_tick.s"] + [f for f in files if f.suffix == ".c"]
-    cmd = [str(GBDK / "bin" / "lcc.exe"), f"-I{ROOT / 'driver'}", "-Wl-yt0x19", "-autobank", "-Wl-yoA",
-           "-Wl-m", "-Wl-j", "-o", str(rom)] + [str(s) for s in srcs]
+            ROOT / "driver" / "furplayer_core.c", ROOT / "driver" / "furplayer_tick.s"]
+    srcs += [f for f in files if f.suffix == ".c"]
+    cmd = [str(GBDK / "bin" / "lcc.exe"), f"-I{ROOT / 'driver'}", f"-DFUR_TEST_MUTE={mute}", "-Wl-yt0x19",
+           "-autobank", "-Wl-yoA", "-Wl-m", "-Wl-j", "-o", str(rom)] + [str(s) for s in srcs]
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=out)
     if res.returncode != 0 or not rom.exists():
         raise SystemExit(f"{name}: GBDK build failed\n{res.stdout}\n{res.stderr}")
@@ -102,6 +103,8 @@ def main():
     ap.add_argument("--model", default="Gameboy", choices=["Gameboy", "GameboyColor"])
     ap.add_argument("--furnace", type=Path, default=furtrace.DEFAULT_FURNACE, help="traced Furnace build")
     ap.add_argument("--approx-loop", action="store_true", help="see tools/fur2gb.py --approx-loop")
+    ap.add_argument("--mute", type=int, default=0,
+                    help="fur_mute mask for the ROM: Furnace's writes to those channels must be missing")
     a = ap.parse_args()
     results = []
     for fur in a.songs:
@@ -116,7 +119,10 @@ def main():
             print(f"{name}: CONVERT FAIL: {e}", flush=True)
             continue
         exp = fur2gb.expected_writes(trace)[:fur2gb.compared_ticks(trace, info["exact_ticks"])]
-        rom = build_rom(name, info, out)
+        if a.mute:
+            exp = [[w for w in t if fur2gb.owner(w[0]) < 0 or not (a.mute >> fur2gb.owner(w[0])) & 1]
+                   for t in exp]
+        rom = build_rom(name, info, out, a.mute)
         got, cost = run_mesen(rom, len(exp), a.model)
         err = compare(name, trace, exp, got)
         nw = sum(len(x) for x in exp)

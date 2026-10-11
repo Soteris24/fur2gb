@@ -43,7 +43,9 @@ Options:
 
 ### 3. Play it
 
-Compile `driver/furplayer.c` and `driver/furplayer_tick.s` together with the generated files:
+Compile `driver/furplayer.c`, `driver/furplayer_core.c` and `driver/furplayer_tick.s` together with the generated
+files. `furplayer_core.c` and `furplayer_tick.s` must be in bank 0; `furplayer.c` may be banked (define
+`FUR_API` as `BANKED` then):
 
 ```c
 #include "furplayer.h"
@@ -60,6 +62,8 @@ Other calls:
 - `fur_tick()` plays exactly one Furnace tick, if you drive the timing yourself (for example from a
   timer interrupt).
 - `fur_stop()` silences the sound chip.
+- `fur_set_mute(mask)` stops the song writing to the channels in `mask` (bit n = channel n+1), so a
+  sound effect can use them. Unmuting channel 3 reloads the song's current wave.
 - `fur_playing` becomes 0 when a song without a loop ends.
 
 `fur_tick()` and `fur_frame()` live in bank 0, restore the caller's ROM bank and may be called
@@ -78,6 +82,9 @@ The command builds one ROM per song in `build/listen/`.
 ```
 python tests/verify_rom.py music/*.fur
 ```
+
+`--mute N` builds the ROM with channels muted (`fur_mute = N`). The ROM must then make exactly
+Furnace's writes minus those channels'.
 
 For each song:
 
@@ -147,6 +154,7 @@ The stream bytecode is documented at the top of `tools/fur2gb.py`.
 |---|---|
 | ROM | 3-34 KB per song (Pocket Dash's songs) |
 | RAM | about 260 bytes |
+| Bank 0 | about 700 bytes (`furplayer_tick.s` and `furplayer_core.c`) |
 | CPU | `fur_tick()` takes about 1.5-6k cycles on average and up to about 12k on the busiest ticks |
 
 For comparison, hUGEDriver in Pocket Dash costs about 4k cycles per frame on average and 14k at
@@ -155,7 +163,7 @@ most.
 ## Layout
 
 ```
-driver/      the Game Boy player (furplayer.h/.c, furplayer_tick.s)
+driver/      the Game Boy player (furplayer.h/.c, furplayer_core.c, furplayer_tick.s)
 tools/       fur2gb.py (converter), furtrace.py (Furnace runner), build_listen.py,
              build_furnace.sh + furnace_trace.patch (reference Furnace)
 tests/       verify_rom.py (+ verify_rom.lua for Mesen), rom/ (test and listening ROM mains)

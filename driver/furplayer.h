@@ -9,14 +9,19 @@
  *     then once per Furnace tick:   fur_tick();
  *     or once per VBlank:           fur_frame();   (runs 0-2 ticks to keep the song's tick rate)
  *
- * fur_tick() and fur_frame() live in bank 0, restore the caller's ROM bank and may be called
- * from an interrupt handler.
+ * Files: furplayer_tick.s and furplayer_core.c must be in bank 0 (they switch banks);
+ * furplayer.c may be banked (define FUR_API as BANKED then).
+ * fur_tick() restores the caller's ROM bank and may be called from an interrupt handler.
  */
 #ifndef FURPLAYER_H
 #define FURPLAYER_H
 
 #include <gbdk/platform.h>
 #include <stdint.h>
+
+#ifndef FUR_API
+#define FUR_API
+#endif
 
 #define FUR_MAX_CHUNKS 32   /* 16 KB each */
 #define FUR_STREAMS 5       /* A (row commands), B0-B3 (per-channel tick): NSTREAMS in fur2gb.py */
@@ -44,15 +49,24 @@ typedef struct {
 } fur_song_t;
 
 /* Start a song (bank = BANK() of the song header). Powers the APU off and on so it starts
-   from the same state as Furnace's emulated chip. */
-void fur_play(const fur_song_t *song, uint8_t bank) NONBANKED;
+   from the same state as Furnace's emulated chip. Keeps fur_mute. */
+void fur_play(const fur_song_t *song, uint8_t bank) FUR_API;
 /* Stop playback and silence the APU. */
-void fur_stop(void) NONBANKED;
-/* Play one Furnace tick. */
-void fur_tick(void) NONBANKED;
+void fur_stop(void) FUR_API;
 /* Call once per frame (VBlank, 70224 cycles): plays as many ticks as the song's tick rate needs. */
-void fur_frame(void) NONBANKED;
+void fur_frame(void) FUR_API;
+/* Mute channels (bit n = channel n+1): their register writes are skipped while the song goes on,
+   so sound effects can use them. Unmuting channel 3 reloads the song's current wave. */
+void fur_set_mute(uint8_t mask) FUR_API;
+
+/* Bank 0 */
+void fur_tick(void) NONBANKED;
+void fur_reload_wave(void) NONBANKED;
+void fur_forget_wave(void) NONBANKED;
+void fur_copy_banked(void *dst, const void *src, uint16_t len, uint8_t bank) NONBANKED;
 
 extern uint8_t fur_playing;  /* 0 once the song stopped (songs without a loop) */
+extern uint8_t fur_mute;     /* muted channels, see fur_set_mute() */
+extern uint32_t fur_period;  /* current tick period in 1/16 CPU cycles */
 
 #endif

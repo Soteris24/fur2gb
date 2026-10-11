@@ -7,13 +7,16 @@
 ;      step / freq and step % freq computed only when the ch3 period or the step changes
 ;   2. runs the 5 streams in Furnace's write order (A = row commands, B0-B3 = tick() per channel):
 ;      a stream with idle ticks pending counts one down, otherwise it runs ops up to an END op
+; Writes to channels set in fur_mute (bit n = channel n+1) are skipped; the streams run on.
 ; Restores the caller's ROM bank. Clobbers all registers.
+;
+; void fur_reload_wave(void): rewrites the last wave loaded (after something else used wave RAM).
 
 	.module furplayer_tick
 
 	.globl	_fur_playing, _fur_ctx, _fur_chunks, _fur_wave_bank, _fur_wave_ptr
 	.globl	_fur_ac_on, _fur_ac_step, _fur_ac_cnt, _fur_ac_pos, _fur_ac_freq, _fur_nr33
-	.globl	_fur_period, _fur_ac_q, _fur_ac_r
+	.globl	_fur_period, _fur_ac_q, _fur_ac_r, _fur_mute
 	.globl	__current_bank
 
 	rROMB0 = 0x2000
@@ -27,6 +30,8 @@ fur_cur:			; context of the stream being run
 fur_bank:			; bank of the stream being run
 	.ds	1
 fur_tmp:
+	.ds	2
+fur_wave_last:			; id + 1 of the last wave loaded (0 = none)
 	.ds	2
 
 	.area	_CODE
@@ -108,6 +113,10 @@ run_stream:
 	ld	a, (hl+)
 	ld	h, (hl)
 	ld	l, a
+resume:					; back from an op handler: the loop for the mute state
+	ld	a, (_fur_mute)
+	or	a
+	jr	nz, fnext
 
 next:
 	ld	a, (hl+)
@@ -119,62 +128,28 @@ next:
 	ldh	(c), a
 	jr	next
 
-wr_nr33:				; 30 vv: NR33, remembered for the ch3 period
+fnext:					; the same, skipping writes to muted channels
 	ld	a, (hl+)
-	ldh	(0x1d), a
-	ld	(_fur_nr33), a
-	jr	next
-wr_nr34:				; 31 vv qq rl rh: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
+	cp	#0x30
+	jr	nc, not_write
+	ld	c, a
+	call	chan_bit
+	ld	a, (_fur_mute)
+	and	b
 	ld	a, (hl+)
-	ldh	(0x1e), a
-	and	#7
-	ld	d, a
-	ld	a, (_fur_nr33)
-	ld	e, a
-	xor	a
-	sub	e			; low byte, carry = borrow
-	ld	e, a
-	ld	a, #8
-	sbc	a, d
-	ld	d, a			; DE = new freq
-	ld	a, (hl+)		; step / freq, step % freq (from the converter)
-	ld	(_fur_ac_q), a
-	ld	a, (hl+)
-	ld	(_fur_ac_r), a
-	ld	a, (hl+)
-	ld	(_fur_ac_r + 1), a
-	ld	a, e
-	ld	(_fur_ac_freq), a
-	ld	a, d
-	ld	(_fur_ac_freq + 1), a
-	; cnt may exceed a lower freq: pos += cnt / freq, cnt %= freq (pos is only read after the
-	; next tick's step, where Furnace's single division gives the same total)
-	ld	a, (_fur_ac_cnt)
-	sub	e
-	ld	a, (_fur_ac_cnt + 1)
-	sbc	a, d
-	jp	c, next			; cnt < freq
-	push	hl
-	ld	hl, #_fur_ac_cnt
-	ld	a, (hl+)
-	ld	h, (hl)
-	ld	l, a
-	call	div16
+	jr	nz, fnext
+	ld	b, a
 	ld	a, c
-	ld	(_fur_ac_cnt), a
+	add	a, #0x10
+	ld	c, a
 	ld	a, b
-	ld	(_fur_ac_cnt + 1), a
-	ld	a, (_fur_ac_pos)
-	add	a, l
-	and	#31
-	ld	(_fur_ac_pos), a
-	pop	hl
-	jp	next
+	ldh	(c), a
+	jr	fnext
 
 not_write:
-	jr	z, wr_nr33
+	jp	z, wr_nr33
 	cp	#0x32
-	jr	c, wr_nr34
+	jp	c, wr_nr34
 	cp	#0x80
 	jp	nc, special
 
@@ -244,6 +219,85 @@ end_save:				; DE = depth: store bank and position before it
 	ld	(de), a
 	ret
 
+wr_nr33:				; 30 vv: NR33, remembered for the ch3 period
+	ld	a, (_fur_mute)
+	bit	2, a
+	ld	a, (hl+)
+	ld	(_fur_nr33), a
+	jp	nz, resume
+	ldh	(0x1d), a
+	jp	resume
+wr_nr34:				; 31 vv qq rl rh: NR34; freq = 2048 - ((NR34 & 7) << 8 | NR33)
+	ld	a, (_fur_mute)
+	bit	2, a
+	ld	a, (hl+)
+	jr	nz, 1$
+	ldh	(0x1e), a
+1$:	and	#7
+	ld	d, a
+	ld	a, (_fur_nr33)
+	ld	e, a
+	xor	a
+	sub	e			; low byte, carry = borrow
+	ld	e, a
+	ld	a, #8
+	sbc	a, d
+	ld	d, a			; DE = new freq
+	ld	a, (hl+)		; step / freq, step % freq (from the converter)
+	ld	(_fur_ac_q), a
+	ld	a, (hl+)
+	ld	(_fur_ac_r), a
+	ld	a, (hl+)
+	ld	(_fur_ac_r + 1), a
+	ld	a, e
+	ld	(_fur_ac_freq), a
+	ld	a, d
+	ld	(_fur_ac_freq + 1), a
+	; cnt may exceed a lower freq: pos += cnt / freq, cnt %= freq (pos is only read after the
+	; next tick's step, where Furnace's single division gives the same total)
+	ld	a, (_fur_ac_cnt)
+	sub	e
+	ld	a, (_fur_ac_cnt + 1)
+	sbc	a, d
+	jp	c, resume		; cnt < freq
+	push	hl
+	ld	hl, #_fur_ac_cnt
+	ld	a, (hl+)
+	ld	h, (hl)
+	ld	l, a
+	call	div16
+	ld	a, c
+	ld	(_fur_ac_cnt), a
+	ld	a, b
+	ld	(_fur_ac_cnt + 1), a
+	ld	a, (_fur_ac_pos)
+	add	a, l
+	and	#31
+	ld	(_fur_ac_pos), a
+	pop	hl
+	jp	resume
+
+; C = write op (register - $10) -> B = its channel's fur_mute bit (0 for NR50-NR52)
+chan_bit:
+	ld	b, #1
+	ld	a, c
+	cp	#0x05
+	ret	c
+	ld	b, #2
+	cp	#0x0a
+	ret	c
+	ld	b, #4
+	cp	#0x0f
+	ret	c
+	ld	b, #8
+	cp	#0x14
+	ret	c
+	ld	b, #4			; wave RAM
+	cp	#0x20
+	ret	nc
+	ld	b, #0
+	ret
+
 ; DE = depth of a context with depth > 0 -> DE = its top frame's units lo
 top_units:
 	ld	a, (de)
@@ -289,16 +343,27 @@ special:
 	ld	a, (_fur_ac_freq + 1)
 	ld	d, a
 	or	e
-	jp	z, next
+	jp	z, resume
 	push	hl
 	call	ac_divstep
 	pop	hl
-	jp	next
+	jp	resume
 
 op_zombie:				; 88 rr xx nn: $FF00+rr = xx, then nn x (09, 11, 08)
 	ld	a, (hl+)
 	ld	c, a
-	ld	a, (hl+)
+	sub	#0x10
+	push	bc
+	ld	c, a
+	call	chan_bit
+	ld	a, (_fur_mute)
+	and	b
+	pop	bc
+	jr	z, 2$
+	inc	hl			; muted
+	inc	hl
+	jp	resume
+2$:	ld	a, (hl+)
 	ldh	(c), a
 	ld	a, (hl+)
 	ld	b, a
@@ -310,14 +375,14 @@ op_zombie:				; 88 rr xx nn: $FF00+rr = xx, then nn x (09, 11, 08)
 	ldh	(c), a
 	dec	b
 	jr	nz, 1$
-	jp	next
+	jp	resume
 
 op_acreset:
 	xor	a
 	ld	(_fur_ac_pos), a
 	ld	(_fur_ac_cnt), a
 	ld	(_fur_ac_cnt + 1), a
-	jp	next
+	jp	resume
 
 op_stop:				; song over: the remaining streams stop too
 	xor	a
@@ -418,14 +483,33 @@ goto_chunk:				; C = chunk, DE = offset in chunk
 	ld	h, (hl)
 	ld	l, a
 	add	hl, de
-	jp	next
+	jp	resume
 
 op_wave:				; NR30 = 0, then the base wave rotated by the anti-click position
 	and	#1
 	ld	b, a
 	ld	a, (hl+)
 	ld	c, a
+	inc	bc
+	ld	a, c
+	ld	(fur_wave_last), a
+	ld	a, b
+	ld	(fur_wave_last + 1), a
+	ld	a, (_fur_mute)
+	bit	2, a
+	jp	nz, resume
 	push	hl
+	call	wave_copy
+	ld	a, (fur_bank)
+	ldh	(__current_bank), a
+	ld	(rROMB0), a
+	pop	hl
+	jp	resume
+
+; BC = wave id + 1: NR30 = 0, wave RAM = that base wave rotated by the anti-click position.
+; Leaves the wave pool's bank selected.
+wave_copy:
+	dec	bc
 	xor	a
 	ldh	(0x1a), a
 	ld	h, b
@@ -468,7 +552,7 @@ op_wave:				; NR30 = 0, then the base wave rotated by the anti-click position
 	jr	nz, 2$
 	ld	a, (fur_tmp)
 	or	a
-	jr	z, 4$
+	ret	z
 	ld	b, a
 	ld	h, d
 	ld	l, e
@@ -477,11 +561,28 @@ op_wave:				; NR30 = 0, then the base wave rotated by the anti-click position
 	inc	c
 	dec	b
 	jr	nz, 3$
-4$:	ld	a, (fur_bank)
+	ret
+
+_fur_reload_wave::
+	ld	a, (fur_wave_last)
+	ld	c, a
+	ld	a, (fur_wave_last + 1)
+	ld	b, a
+	or	c
+	ret	z
+	ldh	a, (__current_bank)
+	push	af
+	call	wave_copy
+	pop	af
 	ldh	(__current_bank), a
 	ld	(rROMB0), a
-	pop	hl
-	jp	next
+	ret
+
+_fur_forget_wave::
+	xor	a
+	ld	(fur_wave_last), a
+	ld	(fur_wave_last + 1), a
+	ret
 
 ; step / freq and step % freq for the per-tick anti-click update (DE = freq)
 ac_divstep:
@@ -498,13 +599,12 @@ ac_divstep:
 	ld	(_fur_ac_r + 1), a
 	ret
 
-; HL / DE (DE = 1..2047) -> L = quotient low byte, BC = remainder
+; HL / DE (DE = 1..2047) -> L = quotient low byte, BC = remainder (rare: a lower ch3 period,
+; a tick rate change)
 div16:
 	ld	bc, #0
-	ld	a, d
-	or	a
-	jp	nz, div_big
-	.rept	16
+	ld	a, #16
+1$:	push	af
 	add	hl, hl
 	rl	c
 	rl	b
@@ -512,31 +612,13 @@ div16:
 	sub	e
 	ld	a, b
 	sbc	a, d
-	jr	c, .+7
+	jr	c, 2$
 	ld	b, a
 	ld	a, c
 	sub	e
 	ld	c, a
 	inc	l
-	.endm
-	ret
-div_big:				; divisor >= 256: quotient < 256, remainder starts as H
-	ld	c, h
-	ld	h, l
-	ld	l, #0
-	.rept	8
-	add	hl, hl
-	rl	c
-	rl	b
-	ld	a, c
-	sub	e
-	ld	a, b
-	sbc	a, d
-	jr	c, .+7
-	ld	b, a
-	ld	a, c
-	sub	e
-	ld	c, a
-	inc	l
-	.endm
+2$:	pop	af
+	dec	a
+	jr	nz, 1$
 	ret

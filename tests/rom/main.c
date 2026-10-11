@@ -8,7 +8,12 @@ extern const fur_song_t fur_test_song;
 
 volatile uint8_t fur_test_mark;
 
+#ifndef FUR_TEST_MUTE
+#define FUR_TEST_MUTE 0
+#endif
+
 void main(void) {
+    fur_mute = FUR_TEST_MUTE;
     fur_play(&fur_test_song, BANK(fur_test_song));
     while (1) {
         wait_vbl_done();
