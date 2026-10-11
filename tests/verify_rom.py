@@ -15,7 +15,7 @@ Only NR50's VIN bits (masked to 0x77, ignored by Furnace's emulated chip) are al
 from __future__ import annotations
 
 import argparse
-import re
+import os
 import subprocess
 import sys
 import time
@@ -26,8 +26,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 import fur2gb  # noqa: E402
 import furtrace  # noqa: E402
 
-GBDK = Path(r"C:\gbdk")
-MESEN = Path(r"C:\Users\soter\OneDrive\Documents\Mesen.exe")
+GBDK = Path(os.environ.get("GBDK_HOME", r"C:\gbdk"))
+MESEN = Path(os.environ.get("MESEN", r"C:\Users\soter\OneDrive\Documents\Mesen.exe"))
 BUILD = ROOT / "build" / "verify"
 
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build one listening ROM per song: build/listen/<song>.gb (plays at the song's tick rate)."""
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import fur2gb  # noqa: E402
 
-GBDK = Path(r"C:\gbdk")
+GBDK = Path(os.environ.get("GBDK_HOME", r"C:\gbdk"))
 
 
 def main():

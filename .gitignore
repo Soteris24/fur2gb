@@ -1,21 +1,23 @@
-# Temporary and audio capture files
-temp_*
-*.wav
-*.bin
-*.txt
-*.s
+# Reference Furnace source and build (tools/build_furnace.sh)
+.build/
+
+# Converter output, verification and listening ROMs
+build/
+
+# GBDK / Python by-products
 *.o
-*.cdb
+*.rel
+*.lst
+*.sym
 *.noi
 *.map
 *.ihx
+*.cdb
 __pycache__/
-.build/
 
-# Compiled ROMs in bin
-bin/
+# IDE settings
+.idea/
+.vscode/
 
-# fur2gb build output (verification ROMs, generated songs)
-build/
-# the player's hand-written assembly
-!driver/*.s
+# audio renders
+*.wav

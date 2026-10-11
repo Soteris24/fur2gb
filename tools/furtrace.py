@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_FURNACE = ROOT / ".build" / "furnace-0682-build" / "furnace.exe"
+DEFAULT_FURNACE = Path(os.environ.get("FUR2GB_FURNACE", ROOT / ".build" / "furnace-0682-build" / "furnace.exe"))
 
 
 @dataclass
