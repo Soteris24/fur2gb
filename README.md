@@ -97,6 +97,48 @@ For each song:
 
 It prints `PASS` or the first differing write, with its order and row.
 
+## uge2fur: hUGETracker songs to Furnace
+
+`tools/uge2fur.py` converts a hUGETracker module (`.uge`, any version) into a Furnace module for
+the Game Boy that plays like hUGEDriver plays it, and that you can keep editing in Furnace:
+
+```
+python tools/uge2fur.py song.uge -o song.fur
+```
+
+The song keeps its structure: the same orders and patterns (a pattern that has to differ between
+orders is split, identical ones are shared), one Furnace instrument per hUGETracker instrument
+(subpatterns become macros and Game Boy hardware sequences), the same waves, speed and tick rate.
+hUGETracker effects become their Furnace equivalents.
+
+hUGEDriver doesn't work like Furnace, so the converter plays the song with a model of hUGEDriver
+(`tools/hugedriver.py`) and writes what Furnace needs to do the same on every row: stops for effects
+that last one row in hUGETracker but continue in Furnace, legato for notes without an instrument
+(hUGEDriver doesn't restart those), arpeggio orders that line up with hUGEDriver's global tick
+counter, its square-wave vibrato (`E308`, `E402`), fine pitch for the six notes its note table has
+1-2 units away from equal temperament, and its quirks (a CH3 note without an instrument silences
+the channel, arpeggios and slides turn the note length off, `9xx` on noise ORs into NR43, ...).
+
+**Checking.** With the reference Furnace built (step 1 above), `uge2fur.py` renders the result and
+compares what every channel outputs on every tick (`tools/apumodel.py`: volume, period, duty,
+wave, panning) with hUGEDriver's output, and prints how many ticks differ. Differences that don't
+matter are counted apart: 1-2 period units (hUGEDriver's note table, under 3 cents) and arpeggios
+or vibratos at another point of their cycle. `tools/uge2fur_debug.py song.uge TICK` shows both
+sides around a tick. On hUGETracker's 23 sample songs and 17 Pocket Dash songs, most songs match
+on 99-100% of the ticks.
+
+**The model.** `tools/hugedriver.py` follows hUGEDriver (hUGETracker 1.0.11) instruction by
+instruction; `tests/verify_hugedriver.py` checks it against the real driver (built with
+hUGETracker's `uge2source` and rgbds, run in Mesen: `HUGETRACKER`, `MESEN`): 49 of 52 songs make
+the same writes for 20000 ticks, the other 3 hit a hUGETracker export bug the model reports (a
+pattern used on two channels only exports the instruments of the first one; the driver then reads
+garbage, in hUGETracker too).
+
+What can't be converted exactly (the converter warns): `5xx` (NR50 master volume) and `6xx`
+(assembly routines) have no Furnace equivalent; `8xx` that turns a channel off in both speakers;
+slides past the top or bottom of the period range (hUGEDriver wraps them around); a few effects
+inside subpatterns (`3xx`, `7xx`, `Exx`).
+
 ## How it works
 
 Instead of re-implementing Furnace's playback engine on the Game Boy, **Furnace itself is the
@@ -166,6 +208,10 @@ most.
 driver/      the Game Boy player (furplayer.h/.c, furplayer_core.c, furplayer_tick.s)
 tools/       fur2gb.py (converter), furtrace.py (Furnace runner), build_listen.py,
              build_furnace.sh + furnace_trace.patch (reference Furnace)
-tests/       verify_rom.py (+ verify_rom.lua for Mesen), rom/ (test and listening ROM mains)
+             uge2fur.py (hUGETracker -> Furnace), uge.py (.uge reader), hugedriver.py (driver
+             model), furfile.py (.fur writer), apumodel.py (APU output comparison),
+             uge2fur_debug.py
+tests/       verify_rom.py (+ verify_rom.lua for Mesen), rom/ (test and listening ROM mains),
+             verify_hugedriver.py + huge_reference.py + huge_ref/ (driver model vs real driver)
 test_songs/  example songs
 ```
