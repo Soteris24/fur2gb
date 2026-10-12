@@ -58,8 +58,11 @@ def f32(x: float) -> float:
     return struct.unpack("<f", struct.pack("<f", x))[0]
 
 
-def anticlick_step(hz: float) -> int:
-    """antiClickPeriodCount += (chipClock>>1)/getCurHz(): float32 math, truncated (count < freq)."""
+def anticlick_step(hz: float, enabled: bool = True) -> int:
+    """antiClickPeriodCount += (chipClock>>1)/getCurHz(): float32 math, truncated (count < freq).
+    0 when the song has anti-click off (the player doesn't use it; slow rates are then fine)."""
+    if not enabled:
+        return 0
     q = f32(f32(2097152.0) / f32(max(f32(hz), 1.0)))
     k = int(q)  # count + q < 2^24 and count is integral, so trunc(count + q) == count + trunc(q)
     if k + 2048 > 0xFFFF:
@@ -137,10 +140,10 @@ def canon_ticks(trace, anticlick_enabled):
             if t.hz != hz:
                 # the player steps anti-click before a tick's ops: the new rate goes at the very
                 # end of the previous tick (stream B3 runs last)
-                out[-1][4] += (bytes([SETRATE]) + anticlick_step(t.hz).to_bytes(2, "little")
+                out[-1][4] += (bytes([SETRATE]) + anticlick_step(t.hz, anticlick_enabled).to_bytes(2, "little")
                                + tick_period(t.hz).to_bytes(3, "little"))
         hz = t.hz
-        ac.tick(anticlick_step(hz))
+        ac.tick(anticlick_step(hz, anticlick_enabled))
         cur = 0           # stream receiving ops: 0 = A until the "P" marker, then 1 + channel
         in_tick = False
         i = 0
@@ -194,7 +197,7 @@ def canon_ticks(trace, anticlick_enabled):
                 ac.write(a, v)
                 code = bytes([{0x1d: OP_NR33, 0x1e: OP_NR34}.get(a, a - 0x10), v])
                 if a == 0x1e:
-                    q, r = divmod(anticlick_step(hz), ac.freq())
+                    q, r = divmod(anticlick_step(hz, anticlick_enabled), ac.freq())
                     code += bytes([q & 0xff, r & 0xff, r >> 8])
                 o = owner(a)
                 i += 1
@@ -407,7 +410,7 @@ class PlayerModel:
         self.chunks = chunks
         self.waves = waves
         self.ac = AntiClick(anticlick)
-        self.k = anticlick_step(hz)
+        self.k = anticlick_step(hz, anticlick)
         self.ctx = [{"pc": e, "stack": [], "idle": 0} for e in entries]
         self.playing = True
 
@@ -554,7 +557,7 @@ def emit_c(out_dir: Path, name: str, song, bank_for=None, include="furplayer.h")
               f"    {len(chunks)}, /* chunks */",
               f"    {wave_chunk if wave_chunk is not None else 0xFF}, /* wave pool chunk */",
               f"    {1 if anticlick else 0}, /* anti-click */",
-              f"    {anticlick_step(hz)}, /* anti-click step at {hz:g} Hz */",
+              f"    {anticlick_step(hz, anticlick)}, /* anti-click step at {hz:g} Hz */",
               f"    {tick_period(hz)}UL, /* tick period in 1/16 cycles */",
               "    { " + ", ".join(f"{{ {c}, {o} }}" for c, o in entries) + " }, /* stream entry points */",
               f"    {name}_chunks",
