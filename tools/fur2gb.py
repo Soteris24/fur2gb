@@ -66,7 +66,8 @@ def anticlick_step(hz: float, enabled: bool = True) -> int:
     q = f32(f32(2097152.0) / f32(max(f32(hz), 1.0)))
     k = int(q)  # count + q < 2^24 and count is integral, so trunc(count + q) == count + trunc(q)
     if k + 2048 > 0xFFFF:
-        raise SystemExit(f"tick rate {hz} Hz is too slow for the 16-bit anti-click counter")
+        # (analyse() then tries the song without anti-click, which has no such limit)
+        raise AntiClickMismatch(f"tick rate {hz} Hz is too slow for the 16-bit anti-click counter")
     return k
 
 
