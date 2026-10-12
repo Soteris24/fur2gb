@@ -97,6 +97,23 @@ class Converter:
         self.uses_sweep = any(i.nr10() & 0x77 for i in song.duty)
 
     # -- instruments --
+    def wave_index(self, wid):
+        """Furnace wavetable for hUGEDriver waveform id wid. The driver reads 16 bytes at
+        waves + swap(id): for ids above 15 that's a slice across waves, which gets its own table."""
+        if wid <= 15:
+            return wid
+        flat = [(w[2 * i] << 4) | w[2 * i + 1] for w in self.s.waves for i in range(16)] + [0] * 16
+        ofs = hugedriver.swap(wid)
+        data = flat[ofs:ofs + 16]
+        nib = [v for b in data for v in (b >> 4, b & 15)]
+        table = [15 - v for v in nib]
+        if table in self.fur.waves:
+            return self.fur.waves.index(table)
+        self.fur.waves.append(table)
+        self.rep.warn(f"waveform {wid} reads across the song's waves (a hUGEDriver quirk): "
+                      f"added as wave {len(self.fur.waves) - 1}")
+        return len(self.fur.waves) - 1
+
     def twin(self, index):
         """An identical copy of a Furnace instrument (to make Furnace see an instrument change)"""
         if index not in self.twins:
@@ -113,7 +130,7 @@ class Converter:
         t = self.s.noise[number - 1].table()
         return bool(t) and any(c.note != uge.NO_NOTE or c.effect == 9 for c in t)
 
-    def instrument(self, ch, number, env=None, note=None, nolen=False):
+    def instrument(self, ch, number, env=None, note=None, nolen=False, duty=None, level=None):
         """Furnace instrument for hUGETracker instrument `number` on channel ch (env: an NRx2 value
         replacing the instrument's envelope, for Cxx / Axy; note: the note, for noise instruments
         whose subpattern depends on it)"""
@@ -122,7 +139,7 @@ class Converter:
             note = None
         src = self.s.instrument(ch, number)
         nolen = nolen and src.length_enabled
-        key = (typ, number, env, note, nolen)
+        key = (typ, number, env, note, nolen, duty, level)
         if key in self.ins_index:
             return self.ins_index[key]
         bank = ("Duty", "Wave", "Noise")[typ]
@@ -133,6 +150,10 @@ class Converter:
             name += f" [{note}]"
         if nolen:
             name += " (no length)"
+        if duty is not None:
+            name += f" (duty {duty})"
+        if level is not None:
+            name += f" (vol {level})"
         fi = F.FurInstrument(name=name, always_init=True)
         e = src.envelope() if env is None else env
         fi.env_vol, fi.env_dir, fi.env_len = e >> 4, (e >> 3) & 1, e & 7
@@ -154,10 +175,27 @@ class Converter:
         fi.hw_seq += hw
         if soft:
             fi.soft_env = True
+        vm = macros.get(F.MACRO_VOL)
+        if level is not None and vm:
+            base_lvl = WAVE_VOL[src.output_level & 3]
+            k = 0
+            while k < len(vm.values) and vm.values[k] == base_lvl:
+                vm.values[k] = level
+                k += 1
+        if typ == uge.SQUARE and duty is not None:
+            # the row's 9xx comes after the instrument (and before its subpattern) in hUGEDriver
+            dm = macros.get(F.MACRO_DUTY)
+            if dm:
+                k = 0
+                while k < len(dm.values) and dm.values[k] == (src.duty & 3):
+                    dm.values[k] = duty
+                    k += 1
+            else:
+                macros[F.MACRO_DUTY] = F.Macro([duty])
         if typ == uge.SQUARE:
             macros.setdefault(F.MACRO_DUTY, F.Macro([src.duty & 3]))
         elif typ == uge.WAVE:
-            macros.setdefault(F.MACRO_WAVE, F.Macro([src.waveform & 15]))
+            macros.setdefault(F.MACRO_WAVE, F.Macro([self.wave_index(src.waveform & 0xFF)]))
         else:
             macros.setdefault(F.MACRO_DUTY, F.Macro([1 if src.seven_bit else 0]))
         fi.macros = macros
@@ -186,6 +224,8 @@ class Converter:
         wave = ins.waveform & 15
         level = WAVE_VOL[ins.output_level & 3]
         env = env0
+        off = 0          # period offset from the note's (slides, vibrato)
+        pan = None
         step4 = 8 if ins.seven_bit else 0
         nr43 = (hugedriver.note_poly(base) | step4) if base is not None else 0
         steps, seen = [], {}
@@ -198,7 +238,7 @@ class Converter:
             steps_len = (256 if typ == uge.WAVE else 64) - ((ins.length & 255) if typ == uge.WAVE else (ins.length & 63))
             life = min(250, int(steps_len * self.fur.hz / 256) + 1)
         while True:
-            key = (row, arp, duty, wave, level, env, nr43)
+            key = (row, arp, duty, wave, level, env, nr43, off, pan)
             if key in seen or len(steps) >= life:
                 loop = seen.get(key) if len(steps) < life else None
                 break
@@ -211,6 +251,7 @@ class Converter:
             if c.note != uge.NO_NOTE:
                 arp = c.note - 36
                 used.add("arp")
+                off = 0
                 if base is not None:
                     nr43 = hugedriver.note_poly((base + arp) & 0xFF) | step4
                 if pitch:
@@ -222,10 +263,8 @@ class Converter:
                     duty = (par >> 6) & 3
                     used.add("duty")
                 elif typ == uge.WAVE:
-                    wave = par & 15
+                    wave = self.wave_index(par)
                     used.add("wave")
-                    if par > 15:
-                        self.rep.warn(f"{ins.name or 'instrument'}: waveform {par} doesn't exist")
                 else:
                     duty = 1 if par & 8 else 0
                     used.add("duty")
@@ -241,6 +280,9 @@ class Converter:
                     env = ((env & 0x0F) | sc) if typ == uge.SQUARE else sc
                     step["env"] = env
                     used.add("env")
+                    if typ == uge.NOISE and base is not None:
+                        # the restart writes the note's own NR43 (channel_period4)
+                        nr43 = hugedriver.note_poly(base) | step4
             elif e == 0xA and par and typ != uge.WAVE:
                 v = max(0, (env >> 4) - (par & 15))
                 v = min(15, v + (par >> 4))
@@ -249,11 +291,21 @@ class Converter:
                 used.add("env")
             elif e in (1, 2) and par:
                 step["pitch"] = par if e == 1 else -par
+                off += step["pitch"]
                 used.add("pitch")
+            elif e == 8:
+                pan = ((par >> ch) & 1) | (((par >> (ch + 4)) & 1) << 1)
+                used.add("pan")
+            elif e == 4 and par:
+                # vibrato sets the period from the note again (+ depth on "up" ticks); its phase
+                # follows hUGEDriver's global counter, which an instrument can't know: the tick
+                # count stands in for it
+                off = (par & 15) if (len(steps) & (par >> 4)) == 0 else 0
+                used.add("vib")
             elif e or par:
                 self.rep.warn(f"{ins.name or 'instrument'}: subpattern effect {e:X}{par:02X} "
                               f"isn't converted")
-            step.update(arp=arp, duty=duty, wave=wave, level=level, nr43=nr43)
+            step.update(arp=arp, duty=duty, wave=wave, level=level, nr43=nr43, off=off, pan=pan)
             steps.append(step)
             row = nxt if nxt < uge.TABLE_ROWS else 0
         lp = 255 if loop is None else loop
@@ -282,7 +334,16 @@ class Converter:
             macros[F.MACRO_DUTY] = F.Macro([x["duty"] for x in steps], loop=lp)
         if "wave" in used:
             macros[F.MACRO_WAVE] = F.Macro([x["wave"] for x in steps], loop=lp)
-        if "pitch" in used:
+        if "pan" in used:
+            # hUGEDriver's 8xx sets NR51 for all channels; Furnace pans per channel (this one)
+            first = next(k for k, x in enumerate(steps) if x["pan"] is not None)
+            vals = [x["pan"] for x in steps[first:]]
+            macros[F.MACRO_PAN_L] = F.Macro(vals, loop=(lp - first) if loop is not None and loop >= first else 255,
+                                            delay=first)
+        if "vib" in used or ("pitch" in used and "arp" in used):
+            # absolute: the period offset from the (arpeggiated) note on every tick
+            macros[F.MACRO_PITCH] = F.Macro([x["off"] for x in steps], loop=lp, mode=0)
+        elif "pitch" in used:
             # relative: hUGEDriver adds to the period every tick (non-linear pitch: period units)
             macros[F.MACRO_PITCH] = F.Macro([x["pitch"] for x in steps], loop=lp, mode=1)
         # a macro whose looped part is constant ends there instead (a running macro rewrites its
@@ -363,7 +424,17 @@ class Converter:
                 fx.append((0xED, par))
         if eff == 0xE and par == 0:     # cut on tick 0 (before a note plays): silence
             play = False
-            r.note = F.NOTE_OFF
+            if typ == uge.WAVE and not valid:
+                # CH3: hUGEDriver only zeroes NR32; an instrument whose subpattern sets the level
+                # raises it again (its Furnace volume macro does the same; a volume of 0 would
+                # silence the macro for good)
+                fi = self.fur.instruments[new.ins] if new.ins >= 0 else None
+                restored = fi and fi.soft_env and hs.get("nr32_end", 0) & 0x60
+                if not restored:
+                    r.vol = 0
+                    new = replace(new, vol3=0)
+            else:
+                r.note = F.NOTE_OFF
 
         if valid and play:
             r.note = noise_note(note) if typ == uge.NOISE else note + NOTE_OFS
@@ -371,7 +442,8 @@ class Converter:
                 # arpeggio / slide / vibrato write NRx4 without the length bit in hUGEDriver:
                 # from tick 1 the note has no length
                 nolen = (eff in (0, 1, 2, 4) and par > 0 and hs["ticks"] > 1)
-                r.ins = self.instrument(ch, ins, note=note, nolen=nolen)
+                duty = (par >> 6) & 3 if eff == 9 and typ == uge.SQUARE else None
+                r.ins = self.instrument(ch, ins, note=note, nolen=nolen, duty=duty)
                 new = replace(new, ins=r.ins)
                 if typ == uge.WAVE:
                     vol = WAVE_VOL[self.s.instrument(ch, ins).output_level & 3]
@@ -452,7 +524,7 @@ class Converter:
             if typ == uge.SQUARE:
                 fx.append((0x12, (par >> 6) & 3))
             elif typ == uge.WAVE:
-                fx.append((0x10, par & 15))
+                fx.append((0x10, self.wave_index(par)))
             else:
                 fx.append((0x11, 1 if par & 8 else 0))
         elif eff == 0xA:
@@ -502,6 +574,12 @@ class Converter:
         if ch == 2:
             lvl = 0x20 if sc >= 0xA0 else 0x40 if sc >= 0x50 else 0 if sc == 0 else 0x60
             vol = {0x20: 15, 0x40: 8, 0x60: 4, 0: 0}[lvl]
+            if playing and ins and r.ins >= 0 and self.fur.instruments[r.ins].soft_env:
+                # its volume macro has the levels (Furnace's volume scales it): start the macro
+                # at this level instead, until the subpattern sets one
+                r.ins = self.instrument(ch, ins, note=note, level=vol)
+                r.vol = 15
+                return replace(st, ins=r.ins, vol3=-1)
             r.vol = vol
             return replace(st, vol3=vol)
         # CH1/2: NRx2 = (NRx2 & 0x0F) | swap(c); CH4: NRx2 = swap(c); then the note restarts if
@@ -600,6 +678,7 @@ class Converter:
         drv = hugedriver.HugeDriver(self.s)
         path, seen = [], {}
         last_ins = [None] * 4
+        since = [10 ** 6] * 4      # ticks since each channel's last note with an instrument
         while len(path) < max_rows:
             if drv.tick_no == 0:
                 key = (drv.order, drv.row, drv.ticks_per_row, drv.row_break, drv.next_order)
@@ -610,15 +689,19 @@ class Converter:
                 for ch in range(4):
                     c = drv.ch[ch]
                     hs.append({"note": c.note, "highmask": c.highmask, "regs": dict(drv.regs),
-                               "last_ins": last_ins[ch], "counter": drv.counter, "ticks": 0})
+                               "last_ins": last_ins[ch], "counter": drv.counter, "ticks": 0,
+                               "since": since[ch]})
                 path.append((drv.order, drv.row, hs))
                 for ch in range(4):
                     cell = self.s.pattern(ch, drv.order)[drv.row]
                     if cell.note < uge.LAST_NOTE and cell.instrument:
                         last_ins[ch] = cell.instrument
+                        since[ch] = 0
             drv.tick()
+            since = [x + 1 for x in since]
             for h in path[-1][2]:
                 h["ticks"] += 1
+                h["nr32_end"] = drv.regs.get(0x1C, 0)
         self.rep.warn("the song didn't loop within 20000 rows")
         return path, 0, drv
 
@@ -635,7 +718,7 @@ class Converter:
         # places gets the explicit version (sets every state it depends on).
         order_seq = list(range(len(path))) + list(range(loop_at, len(path)))
         default_hs = {"note": 0, "highmask": 0, "regs": dict(apumodel.POST_BOOT), "last_ins": None,
-                      "counter": 1, "ticks": s.ticks_per_row or 256}
+                      "counter": 1, "ticks": s.ticks_per_row or 256, "since": 10 ** 6}
         chosen = {}       # (ch, order, row) -> Row
         explicit = set()
         for _ in range(6):
@@ -750,9 +833,12 @@ def verify(song, fur_path, ticks=None, show=3):
     n = min(len(want), len(got))
     # positions of each tick
     pos = []
+    table_vib = []      # per tick: channels whose subpattern has an arpeggio / vibrato
     d2 = hugedriver.HugeDriver(song)
     for _ in range(n):
         pos.append(d2.position())
+        table_vib.append([bool(c.table) and any(x.effect in (0, 4) and x.param for x in c.table)
+                          for c in d2.ch])
         d2.tick()
     bad = [0, 0, 0, 0]
     tiny = [0, 0, 0, 0]
@@ -772,7 +858,7 @@ def verify(song, fur_path, ticks=None, show=3):
                 o, r, k = pos[t]
                 cell = song.pattern(ch, o)[r]
                 if (w and g and w[0] == g[0] and w[0] in ("sq", "wave") and w[1] == g[1]
-                        and w[3:] == g[3:] and cell.effect in (0, 4) and cell.param):
+                        and w[3:] == g[3:] and (cell.effect in (0, 4) and cell.param or table_vib[t][ch])):
                     phase[ch] += 1     # same arpeggio / vibrato, at another point of its cycle
                     continue
                 bad[ch] += 1
@@ -800,6 +886,10 @@ def main():
     for w in conv.rep.warnings:
         print(f"  warning: {w}")
     if not a.no_verify:
+        import furtrace
+        if not Path(furtrace.DEFAULT_FURNACE).exists():
+            print("  (not checked: the check needs fur2gb's traced Furnace build, see README)")
+            return
         n, bad, first, tiny, phase = verify(song, out, a.ticks)
         total = sum(bad)
         print(f"  check: {n} ticks, " + ", ".join(f"CH{i + 1} {n - b}/{n}" for i, b in enumerate(bad))
