@@ -84,7 +84,8 @@ class Converter:
         self.fur = F.FurSong(
             name=song.name, author=song.artist, comment=song.comment,
             hz=song.tick_rate(), speed=max(1, min(255, song.ticks_per_row or 256)),
-            compat={"linearPitch": 0, "noSlidesOnFirstTick": 1, "pitchMacroIsLinear": 0},
+            compat={"linearPitch": 0, "noSlidesOnFirstTick": 1, "pitchMacroIsLinear": 0, "arp0Reset": 0,
+                    "rowResetsArpPos": 1},
             chip_flags={"chipType": 0, "noAntiClick": True},
         )
         if song.ticks_per_row == 0:
@@ -112,29 +113,32 @@ class Converter:
         t = self.s.noise[number - 1].table()
         return bool(t) and any(c.note != uge.NO_NOTE or c.effect == 9 for c in t)
 
-    def instrument(self, ch, number, env=None, note=None):
+    def instrument(self, ch, number, env=None, note=None, nolen=False):
         """Furnace instrument for hUGETracker instrument `number` on channel ch (env: an NRx2 value
         replacing the instrument's envelope, for Cxx / Axy; note: the note, for noise instruments
         whose subpattern depends on it)"""
         typ = uge.CHANNEL_TYPE[ch]
         if not (typ == uge.NOISE and note is not None and self.noise_per_note(number)):
             note = None
-        key = (typ, number, env, note)
+        src = self.s.instrument(ch, number)
+        nolen = nolen and src.length_enabled
+        key = (typ, number, env, note, nolen)
         if key in self.ins_index:
             return self.ins_index[key]
-        src = self.s.instrument(ch, number)
         bank = ("Duty", "Wave", "Noise")[typ]
         name = src.name or f"{bank} {number}"
         if env is not None:
             name += f" (env {env:02X})"
         if note is not None:
             name += f" [{note}]"
+        if nolen:
+            name += " (no length)"
         fi = F.FurInstrument(name=name, always_init=True)
         e = src.envelope() if env is None else env
         fi.env_vol, fi.env_dir, fi.env_len = e >> 4, (e >> 3) & 1, e & 7
         if typ == uge.WAVE:
             fi.env_vol = 15
-        if src.length_enabled:
+        if src.length_enabled and not nolen:
             if typ == uge.WAVE and src.length > 63:
                 self.rep.warn(f"{name}: wave length {src.length} needs 8 bits, Furnace has 6")
             ln = src.length & 63
@@ -352,7 +356,8 @@ class Converter:
 
         # effects that decide whether the note plays
         if valid and eff == 7:
-            if par == 0:
+            # the note plays on tick par; 0 or a tick past the row's end: never
+            if par == 0 or par >= hs["ticks"]:
                 play = False
             else:
                 fx.append((0xED, par))
@@ -363,7 +368,10 @@ class Converter:
         if valid and play:
             r.note = noise_note(note) if typ == uge.NOISE else note + NOTE_OFS
             if ins and eff != 3:
-                r.ins = self.instrument(ch, ins, note=note)
+                # arpeggio / slide / vibrato write NRx4 without the length bit in hUGEDriver:
+                # from tick 1 the note has no length
+                nolen = (eff in (0, 1, 2, 4) and par > 0 and hs["ticks"] > 1)
+                r.ins = self.instrument(ch, ins, note=note, nolen=nolen)
                 new = replace(new, ins=r.ins)
                 if typ == uge.WAVE:
                     vol = WAVE_VOL[self.s.instrument(ch, ins).output_level & 3]
@@ -384,7 +392,12 @@ class Converter:
                 if hs["ticks"] > 1:
                     fx.append((0xED, 1))
                 new = replace(new, ins=r.ins)
-            if eff != 3 and typ != uge.NOISE:
+            if typ == uge.WAVE and not ins and eff != 3:
+                # hUGEDriver plays a CH3 note by turning the DAC off and on (which stops the
+                # channel) and writing NR34: without an instrument there's no trigger bit, so
+                # the channel stays off
+                r.note = F.NOTE_OFF
+            elif eff != 3 and typ != uge.NOISE:
                 need("legato", 0 if ins else 1, 0xEA)
             elif eff != 3 and not ins:
                 self.rep.warn("CH4 notes without an instrument change the noise without retriggering "
@@ -399,7 +412,7 @@ class Converter:
             # +0, +x, +y by its own stage: order x, y so they line up on this row
             # (the counter is 8 bits and 256 isn't a multiple of 3: it repeats a step every 256
             # ticks, so the best order is counted over the row's actual ticks)
-            s0 = (new.astage + 1) % 3
+            s0 = 0      # rowResetsArpPos: Furnace's arpeggio starts over on every row
             vh = (par & 15, par >> 4, 0)
             phases = [((hs["counter"] + k - 1) & 0xFF) % 3 for k in range(max(1, hs["ticks"]))]
             best = None
@@ -443,7 +456,7 @@ class Converter:
             else:
                 fx.append((0x11, 1 if par & 8 else 0))
         elif eff == 0xA:
-            self.vol_slide(ch, par, r, new, hs, fx, note if valid else hs["note"])
+            new = self.vol_slide(ch, par, r, new, hs, fx, note if valid else hs["note"])
         elif eff == 0xB:
             fx.append((0x0B, par - 1) if par else (0x0D, 0))
         elif eff == 0xC:
@@ -452,21 +465,32 @@ class Converter:
             if par:
                 fx.append((0x0D, par - 1))
         elif eff == 0xE and par:
-            if par < 256:
+            if par < hs["ticks"]:       # (a tick past the row's end never comes)
                 fx.append((0xEC, par))
         elif eff == 0xF:
             fx.append((0x0F, par if par else 255))
 
-        if cont["arp"] or new.arp:
+        # hUGEDriver keeps the period its vibrato left (base + depth on an "up" tick) until
+        # something sets it again: hold it with fine pitch when the vibrato stops
+        if new.vib and not cont["vib"] and not (valid and play) and typ != uge.NOISE:
+            lo, hi = ((0x13, 0x14), (0x18, 0x19), (0x1D, 0x1E))[ch]
+            cur = hs["regs"].get(lo, 0) | ((hs["regs"].get(hi, 0) & 7) << 8)
+            n = hs["note"]
+            if n < uge.LAST_NOTE:
+                ofs = cur - uge.NOTE_TABLE[n] + FINE.get(n, 0)
+                if -128 <= ofs <= 127:
+                    need("fine", 0x80 + ofs, 0xE5)
+        # (rows reached with different states stop whatever they don't set)
+        if cont["arp"] or new.arp or explicit:
             if explicit or cont["arp"] != new.arp:
                 fx.append((0x00, cont["arp"]))
             new = replace(new, arp=cont["arp"])
         if cont["arp"]:
             new = replace(new, astage=(new.astage + hs["ticks"]) % 3)
-        if new.slide != -1 and cont["slide"] == -1:
-            fx.append((new.slide, 0))
+        if cont["slide"] == -1 and (new.slide != -1 or explicit):
+            fx.append((new.slide if new.slide != -1 else 0x01, 0))
         new = replace(new, slide=cont["slide"])
-        if cont["vib"] or new.vib:
+        if cont["vib"] or new.vib or explicit:
             if explicit or cont["vib"] != new.vib:
                 fx.append((0x04, cont["vib"]))
             new = replace(new, vib=cont["vib"])
@@ -511,12 +535,20 @@ class Converter:
         return st
 
     def vol_slide(self, ch, par, r, st, hs, fx, note):
-        if ch == 2:
-            self.rep.warn("Axy on the wave channel isn't converted")
-            return
         last = hs["last_ins"]
         if last is None:
-            return
+            return st
+        if ch == 2:
+            # NR32 reads back | 0x9F: the "volume" is 8 + 2 * level bits + 1, then NR32 = vol << 4
+            # (level = bits 5-6 of that) and the note restarts
+            cur = ((hs["regs"].get(0x1C, 0) | 0x9F) & 0xF0) >> 4
+            v = min(15, max(0, cur - (par & 15)) + (par >> 4))
+            r.vol = {0: 0, 1: 15, 2: 8, 3: 4}[((v << 4) >> 5) & 3]
+            if r.note < 0:
+                r.note = hs["note"] + NOTE_OFS
+            if st.legato:
+                fx.append((0xEA, 0))
+            return replace(st, vol3=r.vol, legato=0)
         cur = hs["regs"][hugedriver.ENV[ch]] >> 4
         v = max(0, cur - (par & 15))
         v = min(15, v + (par >> 4))
@@ -526,6 +558,7 @@ class Converter:
         r.ins = self.instrument(ch, last, env=v << 4, note=note)
         if ch != 3 and st.legato:
             fx.append((0xEA, 0))
+        return replace(st, ins=r.ins, legato=0 if ch != 3 else st.legato)
 
     def add_pan(self, ch, pan, r):
         left, right = (pan >> (ch + 4)) & 1, (pan >> ch) & 1
@@ -592,16 +625,9 @@ class Converter:
     def convert(self):
         s = self.s
         path, loop_at, _ = self.walk()
-        # Furnace pattern numbers: per channel, in order of first use
-        pat_no = [{} for _ in range(4)]
-        for ch in range(4):
-            for key in s.orders[ch]:
-                if key not in pat_no[ch]:
-                    pat_no[ch][key] = len(pat_no[ch])
-            if len(pat_no[ch]) > 256:
-                raise SystemExit(f"channel {ch + 1} uses {len(pat_no[ch])} patterns, Furnace has 256")
-        self.fur.orders = [[pat_no[ch][k] for k in s.orders[ch]] for ch in range(4)]
-
+        # Patterns are converted per order (a row's Furnace version can depend on what the other
+        # channels do in that order, e.g. hUGETracker's 8xx pans all channels) and merged again
+        # when they come out the same.
         # Each row's Furnace version depends on the Furnace state it is reached with. Play the path
         # (twice: the loop's second pass enters rows with the loop's end state) with the rows
         # chosen so far, see what each executed row needs in its state, and settle: a row always
@@ -609,11 +635,11 @@ class Converter:
         # places gets the explicit version (sets every state it depends on).
         order_seq = list(range(len(path))) + list(range(loop_at, len(path)))
         default_hs = {"note": 0, "highmask": 0, "regs": dict(apumodel.POST_BOOT), "last_ins": None,
-                      "counter": 1, "ticks": 0}
-        chosen = {}       # (ch, key, row) -> Row
+                      "counter": 1, "ticks": s.ticks_per_row or 256}
+        chosen = {}       # (ch, order, row) -> Row
         explicit = set()
         for _ in range(6):
-            needs = {}    # (ch, key, row) -> [(repr, Row, hs, st)]
+            needs = {}    # (ch, order, row) -> [(repr, Row, hs, st, pan)]
             state = [FState() for _ in range(4)]
             for idx in order_seq:
                 order, row, hs = path[idx]
@@ -623,7 +649,7 @@ class Converter:
                     if c.effect == 8:
                         pan = c.param
                 for ch in range(4):
-                    k = (ch, s.orders[ch][order], row)
+                    k = (ch, order, row)
                     cell = s.pattern(ch, order)[row]
                     want, after = self.row(ch, cell, state[ch], hs[ch], explicit=k in explicit)
                     if pan is not None:
@@ -640,8 +666,8 @@ class Converter:
                     if k not in explicit:
                         explicit.add(k)
                         changed = True
-                    ch, key, row = k
-                    pick, _ = self.row(ch, s.patterns[key][row], lst[0][3], lst[0][2], explicit=True)
+                    ch, order, row = k
+                    pick, _ = self.row(ch, s.pattern(ch, order)[row], lst[0][3], lst[0][2], explicit=True)
                     if lst[0][4] is not None:
                         self.add_pan(ch, lst[0][4], pick)
                 if repr(chosen.get(k)) != repr(pick):
@@ -652,17 +678,25 @@ class Converter:
         else:
             self.rep.warn("the conversion didn't settle (some rows may depend on how they're reached)")
 
+        self.fur.orders = [[] for _ in range(4)]
         for ch in range(4):
-            for key, no in pat_no[ch].items():
+            seen = {}
+            for order in range(len(s.orders[ch])):
                 rows = []
                 for row in range(64):
-                    k = (ch, key, row)
+                    k = (ch, order, row)
                     if k in chosen:
                         rows.append(chosen[k])
                     else:   # never played
-                        r, _ = self.row(ch, s.patterns[key][row], FState(), default_hs)
+                        r, _ = self.row(ch, s.pattern(ch, order)[row], FState(), default_hs)
                         rows.append(r)
-                self.fur.patterns[(ch, no)] = rows
+                key = repr(rows)
+                if key not in seen:
+                    seen[key] = len(seen)
+                    self.fur.patterns[(ch, seen[key])] = rows
+                self.fur.orders[ch].append(seen[key])
+            if len(seen) > 256:
+                raise SystemExit(f"channel {ch + 1} needs {len(seen)} patterns, Furnace has 256")
         cols = [1] * 4
         for (ch, _), rows in self.fur.patterns.items():
             for r in rows:
@@ -684,7 +718,9 @@ def huge_states(song, ticks):
 
 def fur_states(fur_path, hz, ticks):
     import furtrace
-    trace = furtrace.run(Path(fur_path), 2)
+    trace = furtrace.run(Path(fur_path), 1)
+    if sum(1 for t in trace.ticks if t.chip_ticked()) < ticks:
+        trace = furtrace.run(Path(fur_path), 2 + ticks // max(1, len(trace.ticks)))
     stream = []
     for t in trace.ticks:
         if not t.chip_ticked():
