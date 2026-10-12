@@ -25,6 +25,16 @@ POST_BOOT = {
 CPU = 4194304
 
 
+def canonical_nr43(v):
+    """NR43 only sets the LFSR's clock (524288 / r / 2^(s+1), r = divider or 0.5) and width: the
+    same clock has several encodings. This one keeps the divider at 4..7 where it can (the form
+    Furnace's noise table uses)."""
+    s, w, d = v >> 4, v & 8, v & 7
+    while d < 4 and s > 0:
+        s, d = s - 1, (2 * d if d else 1)
+    return (s << 4) | w | d
+
+
 class _Env:
     def __init__(self):
         self.vol = 0
@@ -191,7 +201,7 @@ class Apu:
                 out.append(("wave", level, self.freq(2), tuple(self.wave), pan) if level else None)
             else:
                 v = self.env[3].vol
-                out.append(("noise", v, self.r.get(0x22, 0), pan) if v else None)
+                out.append(("noise", v, canonical_nr43(self.r.get(0x22, 0)), pan) if v else None)
         return out, self.r.get(0x24, 0) & 0x77
 
 

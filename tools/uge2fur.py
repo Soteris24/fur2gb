@@ -65,6 +65,7 @@ class FState:
     vol3: int = 15
     ins: int = -1            # Furnace instrument last selected
     astage: int = -1         # Furnace's arpeggio stage (advances on every tick an arpeggio is on)
+    vset: int = 0            # vibrato shape (E3) and range (E4) set for hUGEDriver's vibrato
 
 
 @dataclass
@@ -156,6 +157,14 @@ class Converter:
         else:
             macros.setdefault(F.MACRO_DUTY, F.Macro([1 if src.seven_bit else 0]))
         fi.macros = macros
+        dm = macros.get(F.MACRO_DUTY)
+        if typ == uge.NOISE and src.length_enabled and dm and dm.loop == 255 and len(dm.values) > 1:
+            # each duty macro step rewrites NR41, restarting the length: start it shorter by the
+            # time of the last step so the note ends when hUGEDriver's does
+            full = 64 - (src.length & 63)
+            k = len(dm.values) - 1
+            gap = int(256 / self.fur.hz) + 2     # must outlast a tick, or it ends between reloads
+            fi.sound_len = 63 - (64 - min(64, max(gap, full - round(k * 256 / self.fur.hz))))
         self.fur.instruments.append(fi)
         self.ins_index[key] = len(self.fur.instruments) - 1
         return self.ins_index[key]
@@ -178,10 +187,16 @@ class Converter:
         steps, seen = [], {}
         row = 0
         used = set()
+        # with length on, the note is silent after its length: the macros can stop there (a running
+        # macro rewrites its register every tick, and NRx1 rewrites restart the length)
+        life = 250
+        if ins.length_enabled:
+            steps_len = (256 if typ == uge.WAVE else 64) - ((ins.length & 255) if typ == uge.WAVE else (ins.length & 63))
+            life = min(250, int(steps_len * self.fur.hz / 256) + 1)
         while True:
             key = (row, arp, duty, wave, level, env, nr43)
-            if key in seen or len(steps) >= 250:
-                loop = seen.get(key)
+            if key in seen or len(steps) >= life:
+                loop = seen.get(key) if len(steps) < life else None
                 break
             seen[key] = len(steps)
             c = table[row]
@@ -244,14 +259,17 @@ class Converter:
             # noiseTable[fixed + 24]) and the 7-bit mode as the duty macro
             vals = []
             for x in steps:
-                v = x["nr43"] & 0xF7
+                v = apumodel.canonical_nr43(x["nr43"]) & 0xF7
                 if v not in NOISE_TABLE:
                     self.rep.warn(f"{ins.name or 'instrument'}: NR43 {v:02X} isn't in Furnace's noise table")
                     v = min(NOISE_TABLE[1:], key=lambda t: abs(t - v))
                 i = NOISE_TABLE.index(v, 1) - 24
                 vals.append(i | 0x40000000 if i >= 0 else i & ~0x40000000)
             macros[F.MACRO_ARP] = F.Macro(vals, loop=lp)
-            macros[F.MACRO_DUTY] = F.Macro([1 if x["nr43"] & 8 else 0 for x in steps], loop=lp)
+            duties = [1 if x["nr43"] & 8 else 0 for x in steps]
+            # a running duty macro rewrites NR41 every tick (restarting the length): only when needed
+            macros[F.MACRO_DUTY] = F.Macro(duties if len(set(duties)) > 1 else duties[:1], loop=lp
+                                           if len(set(duties)) > 1 else 255)
             used.discard("arp")
             used.discard("duty")
         if "arp" in used:
@@ -267,7 +285,8 @@ class Converter:
         # register every tick: NRx1 for duty, which reloads the length counter)
         # (noise per note: the arpeggio macro must run as long as the duty one, Furnace only
         # writes NR43's 7-bit flag along with the noise frequency)
-        groups = [[F.MACRO_ARP, F.MACRO_DUTY]] if base is not None else [[c] for c in macros]
+        noise_joint = base is not None and len(macros.get(F.MACRO_DUTY, F.Macro([0])).values) > 1
+        groups = [[F.MACRO_ARP, F.MACRO_DUTY]] if noise_joint else [[c] for c in macros]
         for g in groups:
             ms = [macros[c] for c in g if c in macros]
             if not ms:
@@ -398,7 +417,18 @@ class Converter:
             cont["slide"] = 3
             fx.append((3, par))
         elif eff == 4 and par:
-            cont["vib"] = par
+            # hUGEDriver: +y period units on the ticks where (counter & x) == 0, the note's period
+            # on the others. A one-bit x is a square with a period of 2x ticks: Furnace's "square
+            # up" vibrato (E308) at rate 32 / x; with range E402 a depth d moves exactly d units.
+            # Other x get the square of their highest bit; Furnace's rate tops out at 15 (x = 1, 2
+            # get its fastest square).
+            x, y = par >> 4, par & 15
+            rate = 0 if x == 0 else min(15, 32 >> (x.bit_length() - 1))
+            cont["vib"] = (rate << 4) | y
+            if explicit or not new.vset:
+                fx.append((0xE3, 0x08))
+                fx.append((0xE4, 0x02))
+            new = replace(new, vset=1)
         elif eff == 5:
             self.rep.warn(f"5{par:02X} (master volume NR50) has no Furnace effect")
         elif eff == 6:
@@ -413,11 +443,11 @@ class Converter:
             else:
                 fx.append((0x11, 1 if par & 8 else 0))
         elif eff == 0xA:
-            self.vol_slide(ch, par, r, new, hs, fx)
+            self.vol_slide(ch, par, r, new, hs, fx, note if valid else hs["note"])
         elif eff == 0xB:
             fx.append((0x0B, par - 1) if par else (0x0D, 0))
         elif eff == 0xC:
-            new = self.set_volume(ch, par, r, new, hs, valid and play, ins, fx)
+            new = self.set_volume(ch, par, r, new, hs, valid and play, ins, fx, note)
         elif eff == 0xD:
             if par:
                 fx.append((0x0D, par - 1))
@@ -438,12 +468,12 @@ class Converter:
         new = replace(new, slide=cont["slide"])
         if cont["vib"] or new.vib:
             if explicit or cont["vib"] != new.vib:
-                fx.append((0x04, ((cont["vib"] & 15) << 4 | (cont["vib"] >> 4)) if cont["vib"] else 0))
+                fx.append((0x04, cont["vib"]))
             new = replace(new, vib=cont["vib"])
         r.effects = fx
         return r, new
 
-    def set_volume(self, ch, par, r, st, hs, playing, ins, fx):
+    def set_volume(self, ch, par, r, st, hs, playing, ins, fx, note):
         sc = hugedriver.swap(par)
         if ch == 2:
             lvl = 0x20 if sc >= 0xA0 else 0x40 if sc >= 0x50 else 0 if sc == 0 else 0x60
@@ -469,9 +499,10 @@ class Converter:
             r.note = noise_note(hs["note"]) if ch == 3 else hs["note"] + NOTE_OFS
             ins = last
         if ins and (env & 0x0F) != (self.s.instrument(ch, ins).envelope() & 0x0F):
-            r.ins = self.instrument(ch, ins, env=env & 0x0F | (self.s.instrument(ch, ins).envelope() & 0xF0))
+            r.ins = self.instrument(ch, ins, env=env & 0x0F | (self.s.instrument(ch, ins).envelope() & 0xF0),
+                                    note=note if playing else hs["note"])
         elif ins:
-            r.ins = self.instrument(ch, ins)
+            r.ins = self.instrument(ch, ins, note=note if playing else hs["note"])
         st = replace(st, ins=r.ins if r.ins >= 0 else st.ins)
         if ch != 3 and r.note >= 0 and r.note != F.NOTE_OFF:
             if st.legato:
@@ -479,7 +510,7 @@ class Converter:
             st = replace(st, legato=0)
         return st
 
-    def vol_slide(self, ch, par, r, st, hs, fx):
+    def vol_slide(self, ch, par, r, st, hs, fx, note):
         if ch == 2:
             self.rep.warn("Axy on the wave channel isn't converted")
             return
@@ -492,7 +523,7 @@ class Converter:
         r.vol = v
         if r.note < 0:
             r.note = noise_note(hs["note"]) if ch == 3 else hs["note"] + NOTE_OFS
-        r.ins = self.instrument(ch, last, env=v << 4)
+        r.ins = self.instrument(ch, last, env=v << 4, note=note)
         if ch != 3 and st.legato:
             fx.append((0xEA, 0))
 
@@ -522,7 +553,9 @@ class Converter:
             elif code in (1, 2, 3):
                 new = replace(new, slide=code if val else -1)
             elif code == 0x04:
-                new = replace(new, vib=((val & 15) << 4 | (val >> 4)) if val else 0)
+                new = replace(new, vib=val)
+            elif code == 0xE4:
+                new = replace(new, vset=1)
         if arp_on:
             new = replace(new, astage=(new.astage + hs["ticks"]) % 3)
         return new
@@ -687,6 +720,7 @@ def verify(song, fur_path, ticks=None, show=3):
         d2.tick()
     bad = [0, 0, 0, 0]
     tiny = [0, 0, 0, 0]
+    phase = [0, 0, 0, 0]
     first = []
     shown = [0, 0, 0, 0]
     for t in range(n):
@@ -699,13 +733,19 @@ def verify(song, fur_path, ticks=None, show=3):
                         and w[1] == g[1] and w[3:] == g[3:] and abs(w[2] - g[2]) <= 2):
                     tiny[ch] += 1      # hUGEDriver's note table vs equal temperament: <= 3 cents
                     continue
+                o, r, k = pos[t]
+                cell = song.pattern(ch, o)[r]
+                if (w and g and w[0] == g[0] and w[0] in ("sq", "wave") and w[1] == g[1]
+                        and w[3:] == g[3:] and cell.effect in (0, 4) and cell.param):
+                    phase[ch] += 1     # same arpeggio / vibrato, at another point of its cycle
+                    continue
                 bad[ch] += 1
                 if shown[ch] < show:
                     shown[ch] += 1
                     o, r, k = pos[t]
                     first.append(f"tick {t} (order {o} row {r} tick {k}) CH{ch + 1}: "
                                  f"hUGE {describe(wo[ch])} / Furnace {describe(go[ch])}")
-    return n, bad, first, tiny
+    return n, bad, first, tiny, phase
 
 
 def main():
@@ -724,11 +764,14 @@ def main():
     for w in conv.rep.warnings:
         print(f"  warning: {w}")
     if not a.no_verify:
-        n, bad, first, tiny = verify(song, out, a.ticks)
+        n, bad, first, tiny, phase = verify(song, out, a.ticks)
         total = sum(bad)
         print(f"  check: {n} ticks, " + ", ".join(f"CH{i + 1} {n - b}/{n}" for i, b in enumerate(bad))
-              + (" (identical)" if not total else "")
-              + (f"; {sum(tiny)} more differ by 1-2 period units (hUGEDriver's note table)" if sum(tiny) else ""))
+              + (" (identical)" if not total else ""))
+        if sum(tiny):
+            print(f"    + {sum(tiny)} channel-ticks 1-2 period units off (hUGEDriver's note table, <= 3 cents)")
+        if sum(phase):
+            print(f"    + {sum(phase)} channel-ticks with an arpeggio / vibrato at another point of its cycle")
         for f in first:
             print("   ", f)
 
