@@ -144,7 +144,10 @@ def canon_ticks(trace, anticlick_enabled):
                 out[-1][4] += (bytes([SETRATE]) + anticlick_step(t.hz, anticlick_enabled).to_bytes(2, "little")
                                + tick_period(t.hz).to_bytes(3, "little"))
         hz = t.hz
-        ac.tick(anticlick_step(hz, anticlick_enabled))
+        # the counter advances in the chip's tick(), which the tick a song stops on (FFxx, or the
+        # end of a song without a loop) skips: Furnace's extra ticks after it continue from there
+        if t.chip_ticked():
+            ac.tick(anticlick_step(hz, anticlick_enabled))
         cur = 0           # stream receiving ops: 0 = A until the "P" marker, then 1 + channel
         in_tick = False
         i = 0
