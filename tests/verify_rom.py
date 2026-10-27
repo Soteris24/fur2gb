@@ -31,14 +31,31 @@ MESEN = Path(os.environ.get("MESEN", r"C:\Users\soter\OneDrive\Documents\Mesen.e
 BUILD = ROOT / "build" / "verify"
 
 
-def build_rom(name: str, song, out: Path, mute: int = 0) -> Path:
+def driver_copy(out: Path, frames: int) -> Path:
+    """The driver with a call depth of `frames` (a game's copy, like Pocket Dash's FRAMES = 1)."""
+    if frames == fur2gb.MAX_DEPTH_DEFAULT:
+        return ROOT / "driver"
+    drv = out / "driver"
+    drv.mkdir(exist_ok=True)
+    for f in ("furplayer.c", "furplayer_core.c", "furplayer.h", "furplayer_tick.s"):
+        t = (ROOT / "driver" / f).read_text()
+        t2 = (t.replace(f"	FRAMES = {fur2gb.MAX_DEPTH_DEFAULT}	", f"	FRAMES = {frames}	")
+               .replace(f"#define FUR_STACK_DEPTH {fur2gb.MAX_DEPTH_DEFAULT} ", f"#define FUR_STACK_DEPTH {frames} "))
+        if f in ("furplayer.h", "furplayer_tick.s") and t2 == t:
+            raise SystemExit(f"--frames: no call depth found to change in {f}")
+        (drv / f).write_text(t2)
+    return drv
+
+
+def build_rom(name: str, song, out: Path, mute: int = 0, frames: int = 2) -> Path:
     gen = out / "gen"
     files = fur2gb.emit_c(gen, "fur_test_song", song)
     rom = out / "furtest.gb"
-    srcs = [ROOT / "tests" / "rom" / "main.c", ROOT / "driver" / "furplayer.c",
-            ROOT / "driver" / "furplayer_core.c", ROOT / "driver" / "furplayer_tick.s"]
+    drv = driver_copy(out, frames)
+    srcs = [ROOT / "tests" / "rom" / "main.c", drv / "furplayer.c",
+            drv / "furplayer_core.c", drv / "furplayer_tick.s"]
     srcs += [f for f in files if f.suffix == ".c"]
-    cmd = [str(GBDK / "bin" / "lcc.exe"), f"-I{ROOT / 'driver'}", f"-DFUR_TEST_MUTE={mute}", "-Wl-yt0x19",
+    cmd = [str(GBDK / "bin" / "lcc.exe"), f"-I{drv}", f"-DFUR_TEST_MUTE={mute}", "-Wl-yt0x19",
            "-autobank", "-Wl-yoA", "-Wl-m", "-Wl-j", "-o", str(rom)] + [str(s) for s in srcs]
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=out)
     if res.returncode != 0 or not rom.exists():
@@ -105,7 +122,10 @@ def main():
     ap.add_argument("--approx-loop", action="store_true", help="see tools/fur2gb.py --approx-loop")
     ap.add_argument("--mute", type=int, default=0,
                     help="fur_mute mask for the ROM: Furnace's writes to those channels must be missing")
+    ap.add_argument("--frames", type=int, default=fur2gb.MAX_DEPTH,
+                    help="player call depth (a game's copy of the driver: Pocket Dash uses 1)")
     a = ap.parse_args()
+    fur2gb.MAX_DEPTH = a.frames
     results = []
     for fur in a.songs:
         name = fur2gb.ident(fur.stem)
@@ -122,7 +142,7 @@ def main():
         if a.mute:
             exp = [[w for w in t if fur2gb.owner(w[0]) < 0 or not (a.mute >> fur2gb.owner(w[0])) & 1]
                    for t in exp]
-        rom = build_rom(name, info, out, a.mute)
+        rom = build_rom(name, info, out, a.mute, a.frames)
         got, cost = run_mesen(rom, len(exp), a.model)
         err = compare(name, trace, exp, got)
         nw = sum(len(x) for x in exp)

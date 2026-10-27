@@ -45,6 +45,7 @@ import furtrace  # noqa: E402
 
 CHUNK_SIZE = 16384
 MAX_DEPTH = 2          # player call stack size per stream (FUR_STACK_DEPTH in furplayer.h)
+MAX_DEPTH_DEFAULT = MAX_DEPTH   # the value in driver/ (a game's copy may use less)
 MAX_CHUNKS = 8         # FUR_MAX_CHUNKS in furplayer.h, wave pool included
 NSTREAMS = 5           # A, B0..B3
 OP_NR33, OP_NR34 = 0x30, 0x31
