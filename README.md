@@ -25,6 +25,9 @@ This clones Furnace **v0.6.8.2** (the version the songs are written in) into `.b
 `tools/furnace_trace.patch` and builds the command-line player. It takes about 15 minutes. Set
 `FUR2GB_FURNACE` to use a different traced build.
 
+On Windows you can skip this: `prebuilt/furnace-trace-windows.zip` has the same build ready to
+run. Unzip it to `.build/furnace-0682-build/`.
+
 ### 2. Convert a song
 
 ```
